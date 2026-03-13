@@ -1,0 +1,10 @@
+{
+  "denylist_files": [
+    "micheline/configs/guard.json",
+    "micheline/configs/policy.json",
+    "micheline/service.py",
+    "micheline/core/security/*"
+  ],
+  "patch_max_lines": 500,
+  "cooldown_minutes_between_patches": 30
+}

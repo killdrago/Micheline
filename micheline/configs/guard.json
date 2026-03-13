@@ -1,0 +1,6 @@
+{
+  "allow_self_modify": false,
+  "require_human_approval": true,
+  "allowed_roots": ["C:/Users/Dragonus/Desktop/IA micheline"],
+  "allow_write_outside": false
+}
