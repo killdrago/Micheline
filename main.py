@@ -23,6 +23,9 @@ import time
 import tempfile  # Optionnel (patch tmp)
 from micheline import self_awareness_tool
 from micheline.intel.watchers import WatcherService
+import queue
+import datetime
+import webbrowser
 
 # Coller/aperçus d'images (Pillow)
 try:
@@ -1146,6 +1149,11 @@ class WindowMoveSizeGuard:
 class App:
     def __init__(self, root):
         self.root = root
+        self.news_queue = queue.Queue()
+        self.news_max_rows = 500
+        self._start_watcher_service()
+        self.watcher_service = None
+        self._watcher_thread = None
         self.root.title("Micheline - Tableau de Bord IA")
         self._rag_started_at = None
         self._learn_started_at = None
@@ -1188,6 +1196,9 @@ class App:
         self.notebook.add(self.config_tab, text="Configuration du robot")
         self.status_tab = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(self.status_tab, text="État IA")
+        self.news_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.news_tab, text="News")
+        self.populate_news_tab()
         
         self.llm = None
         self.llm_loading = False
@@ -1293,6 +1304,31 @@ class App:
 
         print("[MT5 Finder] Échec de la localisation automatique de terminal64.exe.")
         return None
+
+    def _enable_ctrl_c_copy(self, text_widget):
+        # Permet Ctrl+C même si le Text est disabled
+        def _copy(event=None):
+            try:
+                sel = text_widget.get("sel.first", "sel.last")
+            except Exception:
+                return "break"  # rien sélectionné
+
+            try:
+                text_widget.clipboard_clear()
+                text_widget.clipboard_append(sel)
+            except Exception:
+                pass
+            return "break"
+
+        text_widget.bind("<Control-c>", _copy)
+        text_widget.bind("<Control-C>", _copy)
+        text_widget.bind("<Control-Insert>", _copy)
+
+        # Important: le widget doit pouvoir prendre le focus
+        try:
+            text_widget.configure(takefocus=1)
+        except Exception:
+            pass
 
     def _ensure_mt5_is_running(self):
         """
@@ -2266,6 +2302,81 @@ class App:
         config.save_config_data(cfg)
         if messagebox.askyesno("Redémarrage Requis", "Un redémarrage est nécessaire. Redémarrer maintenant ?"): self.restart_app()
 
+    def toggle_feature_selection(self):
+        """
+        Callback du Checkbutton:
+        'Activer la sélection auto des indicateurs (par paire)'
+        Objectif: ne pas planter + activer/désactiver l'UI de sélection manuelle.
+        """
+
+        # 1) Lire l'état du bouton
+        try:
+            enabled = bool(self.auto_select_var.get())
+        except Exception:
+            enabled = False
+
+        # 2) Mémoriser l'état (utile ailleurs)
+        self.auto_feature_selection_enabled = enabled
+
+        # 3) Sauvegarde config (si tu as bien load/save dans config.py)
+        try:
+            data = config.load_config_data()
+            data["auto_feature_selection_enabled"] = enabled
+            if hasattr(config, "save_config_data"):
+                config.save_config_data(data)
+        except Exception:
+            pass
+
+        # 4) Activer/désactiver les checkboxes manuelles si tu as gardé une liste de widgets
+        # (ces noms peuvent varier selon ton code -> on fait "safe")
+        possible_lists = [
+            "feature_checkbuttons",
+            "feature_checkbox_widgets",
+            "feature_widgets",
+            "indicator_checkbuttons",
+        ]
+
+        widgets = None
+        for name in possible_lists:
+            lst = getattr(self, name, None)
+            if isinstance(lst, (list, tuple)) and lst:
+                widgets = lst
+                break
+
+        if widgets:
+            for w in widgets:
+                try:
+                    # tk.Text / tk widgets
+                    w.configure(state=("disabled" if enabled else "normal"))
+                except Exception:
+                    try:
+                        # ttk widgets
+                        if enabled:
+                            w.state(["disabled"])
+                        else:
+                            w.state(["!disabled"])
+                    except Exception:
+                        pass
+
+        # 5) Si tu as une fonction existante qui applique réellement la sélection auto,
+        # on l'appelle si elle existe (sinon on ne casse rien).
+        if enabled:
+            for fname in (
+                "apply_auto_feature_selection",
+                "auto_select_features_for_current_pair",
+                "_auto_select_features_for_current_pair",
+                "auto_select_features",
+            ):
+                fn = getattr(self, fname, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception as e:
+                        print("[FEATURES] auto-select error:", e)
+                    break
+
+        print(f"[FEATURES] Sélection auto des indicateurs: {'ON' if enabled else 'OFF'}")
+
     def populate_logs_tab(self):
         # Zone scrollable pour logs
         self.logs_console = scrolledtext.ScrolledText(
@@ -2274,44 +2385,86 @@ class App:
             bg="black",
             fg="limegreen",
             font=("Consolas", 9),
-            state=tk.DISABLED
+            state=tk.DISABLED,
+            takefocus=1
         )
         self.logs_console.pack(fill=tk.BOTH, expand=True)
+
+        # Important: donner le focus au Text quand on clique dedans (sinon Ctrl+C ne part pas)
+        def _focus_text(event=None):
+            try:
+                self.logs_console.focus_set()
+            except Exception:
+                pass
+            # ne pas "break" -> on laisse Tk gérer la sélection normale à la souris
+            return None
+
+        self.logs_console.bind("<Button-1>", _focus_text)
+        self.logs_console.bind("<ButtonRelease-1>", _focus_text)
 
         # Redirection stdout/stderr → logs_console
         self.logs_console.write_safe = self.write_to_console_safe
         sys.stdout = ConsoleRedirector(self.logs_console)
         sys.stderr = ConsoleRedirector(self.logs_console)
 
-        # -------- Ajout copie clic droit + Ctrl+C --------
+        # -------- Copie clic droit + Ctrl/Cmd+C --------
         def copy_selection(event=None):
             try:
                 text = self.logs_console.get("sel.first", "sel.last")
             except tk.TclError:
                 text = ""
+
             if text:
-                self.root.clipboard_clear()
-                self.root.clipboard_append(text)
+                try:
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(text)
+                    self.root.update_idletasks()
+                except Exception:
+                    pass
+            return "break"
+
+        def select_all(event=None):
+            try:
+                self.logs_console.tag_add("sel", "1.0", "end-1c")
+                self.logs_console.mark_set("insert", "1.0")
+                self.logs_console.see("insert")
+            except Exception:
+                pass
             return "break"
 
         # Menu contextuel clic droit
         menu = tk.Menu(self.logs_console, tearoff=0)
         menu.add_command(label="Copier", command=copy_selection)
+        menu.add_command(label="Tout sélectionner", command=select_all)
 
         def show_context_menu(event):
             try:
+                _focus_text()
                 menu.tk_popup(event.x_root, event.y_root)
             finally:
-                menu.grab_release()
+                try:
+                    menu.grab_release()
+                except Exception:
+                    pass
             return "break"
 
-        # Bind du menu contextuel
+        # Bind du menu contextuel (Windows/Linux = Button-3, mac parfois Button-2)
         self.logs_console.bind("<Button-3>", show_context_menu)
+        self.logs_console.bind("<Button-2>", show_context_menu)
 
         # Bind clavier (Windows/Linux Ctrl+C, macOS Cmd+C)
         self.logs_console.bind("<Control-c>", copy_selection)
+        self.logs_console.bind("<Control-C>", copy_selection)
+        self.logs_console.bind("<Control-Insert>", copy_selection)
         self.logs_console.bind("<Command-c>", copy_selection)
+        self.logs_console.bind("<Command-C>", copy_selection)
 
+        # Bonus: Ctrl+A / Cmd+A pour tout sélectionner
+        self.logs_console.bind("<Control-a>", select_all)
+        self.logs_console.bind("<Control-A>", select_all)
+        self.logs_console.bind("<Command-a>", select_all)
+        self.logs_console.bind("<Command-A>", select_all)
+    
     def copy_selected_logs(self, event=None):
         try: text = self.logs_console.get("sel.first", "sel.last")
         except tk.TclError: text = ""
@@ -2539,6 +2692,102 @@ class App:
                 self.populate_status_tab()
         except Exception as e:
             print(f"[STATUS] refresh on select error: {e}")
+
+    def _open_selected_news_url(self, event=None):
+        try:
+            sel = self.news_tree.selection()
+            if not sel:
+                return
+            values = self.news_tree.item(sel[0], "values")
+            if not values or len(values) < 4:
+                return
+            url = values[3]
+            if url:
+                webbrowser.open(url)
+        except Exception:
+            pass
+
+    def _pump_news_queue(self):
+        try:
+            # Vide la queue (tout ce qui est arrivé depuis le dernier tick)
+            while True:
+                item = self.news_queue.get_nowait()
+
+                # Insert en haut
+                try:
+                    self.news_tree.insert(
+                        "", 0,
+                        values=(item["read_at"], item["site"], item["title"], item["url"])
+                    )
+                except Exception:
+                    pass
+
+                # Limiter le nombre de lignes
+                try:
+                    children = self.news_tree.get_children("")
+                    if len(children) > self.news_max_rows:
+                        # supprime en bas
+                        for iid in children[self.news_max_rows:]:
+                            self.news_tree.delete(iid)
+                except Exception:
+                    pass
+
+        except queue.Empty:
+            pass
+        except Exception as e:
+            try:
+                print("[NEWS TAB] pump error:", e)
+            except Exception:
+                pass
+
+        # Re-planifie
+        try:
+            self.root.after(500, self._pump_news_queue)  # 0.5s
+        except Exception:
+            pass
+
+    def news_log_read(self, site: str, title: str, url: str):
+        """
+        À appeler depuis N'IMPORTE QUEL thread.
+        Ne touche pas Tkinter directement: push dans la queue.
+        """
+        try:
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.news_queue.put({
+                "read_at": ts,
+                "site": (site or "").strip(),
+                "title": (title or "").strip(),
+                "url": (url or "").strip(),
+            })
+        except Exception:
+            pass
+
+    def populate_news_tab(self):
+        # Tableau des lectures
+        columns = ("read_at", "site", "title", "url")
+
+        self.news_tree = ttk.Treeview(self.news_tab, columns=columns, show="headings")
+        self.news_tree.heading("read_at", text="Lu le")
+        self.news_tree.heading("site", text="Site")
+        self.news_tree.heading("title", text="Article")
+        self.news_tree.heading("url", text="URL")
+
+        self.news_tree.column("read_at", width=150, anchor="w")
+        self.news_tree.column("site", width=160, anchor="w")
+        self.news_tree.column("title", width=520, anchor="w")
+        self.news_tree.column("url", width=520, anchor="w")
+
+        yscroll = ttk.Scrollbar(self.news_tab, orient="vertical", command=self.news_tree.yview)
+        self.news_tree.configure(yscrollcommand=yscroll.set)
+
+        self.news_tree.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+
+        # Double-clic = ouvrir l’URL
+        self.news_tree.bind("<Double-1>", self._open_selected_news_url)
+
+        # Démarre la pompe qui vide la queue et met à jour le tableau
+        self._pump_news_queue()
 
     def save_general_config(self):
         try:
@@ -3184,9 +3433,9 @@ class App:
                 print(f"[VLM] Init échoue: {e}")
                 self.vlm = None
                 
-    # --- Watcher Service (Bloc 2) ---
-    self.watcher_service = None
-    self._watcher_enabled = bool(config.load_config_data().get("watcher_service_enabled", False))
+        # --- Watcher Service (Bloc 2) ---
+        self.watcher_service = None
+        self._watcher_enabled = bool(config.load_config_data().get("watcher_service_enabled", False))
     
     def _init_watcher_service(self):
         """Initialise le service de surveillance (si activé dans config)."""
@@ -4753,29 +5002,105 @@ class App:
             print(f"ERREUR orchestrateur: {e}")
 
     def on_closing(self):
-        print("\n--- Fermeture de l'application... ---")
-        if self.worker_process and self.worker_process.poll() is None:
-            print("--- [ARCHITECTE] Arrêt du processus Worker... ---")
-            self.worker_process.terminate()
-            try: self.worker_process.wait(timeout=5)
-            except subprocess.TimeoutExpired: self.worker_process.kill()
-            print("--- [ARCHITECTE] Worker arrêté. ---")
-        if os.path.exists(STATUS_FILE):
-            try: os.remove(STATUS_FILE)
-            except Exception: pass
-        # Arrête le watcher proprement
-        if self.watcher_service:
+        # Empêche l'erreur si l'app n'a pas fini d'initialiser certains attributs
+        try:
+            print("Arrêt du processus worker")
+        except Exception:
+            pass
+
+        # 1) Stop worker (si présent)
+        try:
+            w = getattr(self, "worker", None)
+            if w is not None:
+                # adapte selon ton worker: stop()/shutdown()/request_stop()
+                if hasattr(w, "stop"):
+                    w.stop()
+                elif hasattr(w, "shutdown"):
+                    w.shutdown()
+                print("Worker arrêté")
+        except Exception as e:
             try:
-                self.watcher_service.stop()
+                print("[WARN] Erreur arrêt worker:", e)
             except Exception:
                 pass
-                
-        self.root.destroy()
-        
-    def toggle_feature_selection(self):
-        state = "disabled" if self.auto_select_var.get() else "normal"
-        for widget in self.manual_feature_widgets:
-            widget.config(state=state)
+
+        # 2) Stop watcher (si présent)
+        try:
+            ws = getattr(self, "watcher_service", None)
+            if ws is not None:
+                if hasattr(ws, "stop"):
+                    ws.stop()
+                elif hasattr(ws, "shutdown"):
+                    ws.shutdown()
+                self.watcher_service = None
+                print("Watcher arrêté")
+        except Exception as e:
+            try:
+                print("[WARN] Erreur arrêt watcher:", e)
+            except Exception:
+                pass
+
+        # 3) Fermer Tkinter proprement
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass        
+        def toggle_feature_selection(self):
+            state = "disabled" if self.auto_select_var.get() else "normal"
+            for widget in self.manual_feature_widgets:
+                widget.config(state=state)
+    
+    def _start_watcher_service(self):
+        # Toujours safe: on initialise même si ça échoue
+        self.watcher_service = None
+        self._watcher_thread = None
+
+        try:
+            from micheline.intel.watchers import WatcherService
+        except Exception as e:
+            print("[WATCHERS] Import impossible:", e)
+            return False
+
+        try:
+            # IMPORTANT:
+            # on_read = self.news_log_read => le watcher "pousse" les lectures dans l'onglet News
+            self.watcher_service = WatcherService(
+                registry_path="micheline/intel/entities.json",
+                db_path="micheline/intel/db/news_reads.sqlite",
+                poll_interval_sec=120,
+                on_read=self.news_log_read
+            )
+        except Exception as e:
+            print("[WATCHERS] Init WatcherService impossible:", e)
+            self.watcher_service = None
+            return False
+
+        try:
+            self.watcher_service.start()
+            print("[WATCHERS] Démarré via .start()")
+            return True
+        except Exception as e:
+            print("[WATCHERS] start() a échoué:", e)
+            return False
+
+        def _stop_watcher_service(self):
+            try:
+                ws = getattr(self, "watcher_service", None)
+                if ws is None:
+                    return
+                if hasattr(ws, "stop"):
+                    ws.stop()
+                elif hasattr(ws, "shutdown"):
+                    ws.shutdown()
+            except Exception as e:
+                print("[WATCHERS] stop error:", e)
+            finally:
+                self.watcher_service = None
+                self._watcher_thread = None
     
     def _refresh_attachments_bar(self):
         # Efface l’ancien contenu
@@ -4928,11 +5253,9 @@ class App:
             if unload_sec > 0 and self.llm and hasattr(self.llm, "is_loaded") and self.llm.is_loaded():
                 idle = self.llm.idle_seconds()
                 if idle >= unload_sec:
-                    print(f"[RAM] LLM inactif depuis {idle:.0f}s (limite: {unload_sec}s) → déchargement")
                     try:
                         self.llm.unload()
                     except Exception as e:
-                        print(f"[RAM] Erreur déchargement: {e}")
 
         # 3) Vérification RAM (déchargement d'urgence seulement si PAS en génération)
         try:
@@ -4943,14 +5266,11 @@ class App:
 
             if ram["total_mb"] > 0:
                 if ram["used_percent"] >= limit and not is_generating:
-                    print(f"[RAM] ⚠ ALERTE: {ram['used_percent']}% utilisé (limite: {limit}%)")
                     if self.llm and hasattr(self.llm, "is_loaded") and self.llm.is_loaded():
                         print(f"[RAM] Déchargement d'urgence du LLM")
                         self.llm.unload()
                 elif ram["used_percent"] >= limit and is_generating:
-                    print(f"[RAM] ⚠ RAM haute ({ram['used_percent']}%) mais génération en cours — pas de déchargement")
                 elif ram["used_percent"] >= warn:
-                    print(f"[RAM] Info: {ram['used_percent']}% utilisé")
         except ImportError:
             pass
         except Exception as e:
@@ -4965,10 +5285,7 @@ class App:
             ram = get_ram_info()
             llm_status = "chargé" if (self.llm and hasattr(self.llm, "is_loaded") and self.llm.is_loaded()) else "déchargé"
             gen_status = " | GÉNÉRATION EN COURS" if is_generating else ""
-            print(f"[CLEANUP] {len(self._band_rows)} bulles | LLM: {llm_status} | "
-                  f"RAM: {ram.get('used_percent', '?')}% ({ram.get('available_mb', '?')} MB dispo){gen_status}")
         except Exception:
-            print(f"[CLEANUP] {len(self._band_rows)} bulles actives")
 
         # Replanifie
         self.root.after(30000, self._periodic_cleanup)
