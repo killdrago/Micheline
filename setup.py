@@ -2,6 +2,10 @@
 # - Ajout de la dépendance manquante `langchain-text-splitters`.
 # - Ajout de l'installation des deps Fine‑Tuning (torch/transformers/peft/datasets/accelerate [+ bitsandbytes Linux GPU]).
 # - Le reste est identique (voix, portable, etc.).
+#
+# NOTE (petite correction utile):
+# - Ajout de `feedparser` (utilisé par micheline/intel/watchers.py) pour éviter:
+#   ModuleNotFoundError: No module named 'feedparser'
 
 import subprocess
 import sys
@@ -170,7 +174,10 @@ def install_llama_cpp_optional():
     print("\n=== Tentative d'installation llama-cpp-python ===")
     for tool in ["setuptools","wheel","scikit-build-core","ninja","cmake","typing-extensions","diskcache","jinja2"]:
         install_with_progress(tool)
-    for cmd in [[sys.executable,"-m","pip","install","--upgrade","--prefer-binary","llama-cpp-python"], [sys.executable,"-m","pip","install","--upgrade","--prefer-binary","llama-cpp-python==0.3.16"]]:
+    for cmd in [
+        [sys.executable,"-m","pip","install","--upgrade","--prefer-binary","llama-cpp-python"],
+        [sys.executable,"-m","pip","install","--upgrade","--prefer-binary","llama-cpp-python==0.3.16"]
+    ]:
         if run_stream(cmd): print("=== llama-cpp installé ==="); return True
     print("[WARN] llama-cpp non installé (optionnel)."); return False
 
@@ -184,7 +191,11 @@ def ensure_tesseract_windows() -> bool:
     if has_tesseract_binary(): print("--- Tesseract présent ---"); return True
     print("\n=== Installation Tesseract (winget/choco) ===")
     if which("winget"):
-        if install_with_progress(["winget","install","--id=Tesseract-OCR.Project.Tesseract-OCR","-e", "--accept-package-agreements","--accept-source-agreements"], is_pip=False) and has_tesseract_binary():
+        if install_with_progress(
+            ["winget","install","--id=Tesseract-OCR.Project.Tesseract-OCR","-e",
+             "--accept-package-agreements","--accept-source-agreements"],
+            is_pip=False
+        ) and has_tesseract_binary():
             return True
     if which("choco"):
         if install_with_progress(["choco","install","tesseract","-y"], is_pip=False) and has_tesseract_binary():
@@ -210,6 +221,7 @@ def ensure_tesseract_languages(langs=("eng","fra")) -> bool:
     else:
         target = os.path.join("micheline","cache","tesseract","tessdata"); ensure_dir(target)
         os.environ["TESSDATA_PREFIX"] = os.path.dirname(target)
+
     base_best = "https://github.com/tesseract-ocr/tessdata_best/raw/main"
     base_fast = "https://github.com/tesseract-ocr/tessdata_fast/raw/main"
     ok = True
@@ -227,13 +239,16 @@ def ensure_ocr_dependencies() -> bool:
     print("\n--- Dépendances OCR ---")
     for pkg in ["Pillow","opencv-python-headless"]:
         if not has_pkg(pkg): install_with_progress(pkg)
+
     paddle_ok = has_pkg("paddleocr") or install_with_progress("paddleocr")
     if not paddle_ok and not has_pkg("paddlepaddle"):
         install_with_progress("paddlepaddle==2.5.0")
         paddle_ok = has_pkg("paddleocr") or install_with_progress("paddleocr")
+
     tess_ok = has_pkg("pytesseract") or install_with_progress("pytesseract")
     if os.name == "nt":
         ensure_tesseract_windows(); ensure_tesseract_languages(("eng", "fra"))
+
     ready = bool(paddle_ok or tess_ok)
     print(f"--- OCR prêt: {ready} ---")
     return ready
@@ -281,13 +296,16 @@ def ensure_whisper_cpp(base_dir="micheline", model_name=None):
     bin_name = "main.exe" if os.name == "nt" else "main"
     out_bin = os.path.join(base_dir, "models", "stt", "whisper", bin_name)
     model_path = os.path.join(base_dir, "models", "stt", "whisper", model_name)
+
     if not os.path.isdir(repo_dir):
         if not which("git"): print("[WARN] git absent -> skip whisper.cpp"); return False
         if not run_stream(["git","clone","--depth","1","https://github.com/ggerganov/whisper.cpp", repo_dir]):
             print("[WARN] clone whisper.cpp échoué."); return False
     else:
         run_stream(["git","pull"], cwd=repo_dir)
+
     if not which("cmake"): print("[WARN] cmake absent -> skip build"); return False
+
     if not os.path.exists(out_bin):
         ensure_dir(build_dir)
         cmake_flags = ["-DGGML_METAL=ON"] if sys.platform == "darwin" else []
@@ -301,10 +319,12 @@ def ensure_whisper_cpp(base_dir="micheline", model_name=None):
         ensure_dir(os.path.dirname(out_bin))
         try: shutil.copy2(found, out_bin); os.chmod(out_bin, 0o755)
         except Exception as e: print(f"[WARN] copy binary: {e}")
+
     if not os.path.exists(model_path):
         url = f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{model_name}?download=true"
         if not download_with_progress(url, model_path):
             print("[WARN] Téléchargement modèle whisper échoué."); return False
+
     ok = os.path.exists(out_bin) and os.path.exists(model_path)
     print(f"--- whisper.cpp prêt: {ok} (bin={out_bin}) ---")
     return ok
@@ -315,18 +335,26 @@ def smoke_test_piper(piper_bin: str, voice_onnx: str, out_wav: str = None, espea
         out_wav = out_wav or os.path.join(tempfile.gettempdir(), "piper_test.wav")
         try:
             if os.path.exists(out_wav): os.remove(out_wav)
-        except Exception: pass
+        except Exception:
+            pass
+
         env = None
         if espeak_env_dir:
             env = os.environ.copy()
             env["PATH"] = espeak_env_dir + os.pathsep + env.get("PATH","")
             data_dir = os.path.join(espeak_env_dir, "espeak-ng-data")
             if os.path.isdir(data_dir): env["ESPEAK_DATA_PATH"] = data_dir
-        p = subprocess.Popen([piper_bin, "-m", voice_onnx, "-f", out_wav], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=False, env=env)
+
+        p = subprocess.Popen(
+            [piper_bin, "-m", voice_onnx, "-f", out_wav],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=False, env=env
+        )
         text = "Bonjour, ceci est un test de synthèse vocale locale avec Piper."
         p.communicate(input=text.encode("utf-8"), timeout=60)
         return (p.returncode == 0 and os.path.exists(out_wav) and os.path.getsize(out_wav) > 800)
-    except Exception: return False
+    except Exception:
+        return False
 
 def ensure_piper_and_voice(base_dir="micheline"):
     print("\n=== Piper (TTS) — mode portable (FR+EN+IT+DE) ===")
@@ -352,66 +380,103 @@ def ensure_piper_and_voice(base_dir="micheline"):
     voices_dir = os.path.join(piper_dir, "voices"); ensure_dir(voices_dir)
 
     def have_voice(vname: str) -> bool:
-        return (os.path.exists(os.path.join(voices_dir, f"{vname}.onnx")) and os.path.exists(os.path.join(voices_dir, f"{vname}.onnx.json")))
+        return (
+            os.path.exists(os.path.join(voices_dir, f"{vname}.onnx")) and
+            os.path.exists(os.path.join(voices_dir, f"{vname}.onnx.json"))
+        )
+
     def hf_voice_path(vname: str) -> str:
         parts = vname.replace('_','-').split('-')
         if len(parts) == 4:
             lang, region, speaker, quality = parts
             return f"{lang}/{lang}_{region}/{speaker}/{quality}"
         return ""
+
     def dl_voice(vname: str) -> bool:
         base = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
         path = hf_voice_path(vname)
-        if not path: print(f"[WARN] Nom de voix inconnu: {vname}"); return False
-        onnx_url = f"{base}/{path}/{vname}.onnx"; json_url = f"{base}/{path}/{vname}.onnx.json"
-        onnx_path = os.path.join(voices_dir, f"{vname}.onnx"); json_path = os.path.join(voices_dir, f"{vname}.onnx.json")
-        print(f"--- DL voix: {vname} ---"); ok1 = download_with_progress(onnx_url, onnx_path); ok2 = download_with_progress(json_url, json_path)
+        if not path:
+            print(f"[WARN] Nom de voix inconnu: {vname}"); return False
+        onnx_url = f"{base}/{path}/{vname}.onnx"
+        json_url = f"{base}/{path}/{vname}.onnx.json"
+        onnx_path = os.path.join(voices_dir, f"{vname}.onnx")
+        json_path = os.path.join(voices_dir, f"{vname}.onnx.json")
+        print(f"--- DL voix: {vname} ---")
+        ok1 = download_with_progress(onnx_url, onnx_path)
+        ok2 = download_with_progress(json_url, json_path)
         if not (ok1 and ok2):
             try:
                 if os.path.exists(onnx_path): os.remove(onnx_path)
                 if os.path.exists(json_path): os.remove(json_path)
-            except Exception: pass
+            except Exception:
+                pass
             return False
         return True
 
     for v in voices_to_get:
-        if not have_voice(v): dl_voice(v)
+        if not have_voice(v):
+            dl_voice(v)
 
     test_voice = next((v for v in default_pack if have_voice(v)), None) or next((p.stem for p in Path(voices_dir).glob("*.onnx")), None)
-    if not test_voice: print("[WARN] Pas de voix trouvée pour le test."); return False
+    if not test_voice:
+        print("[WARN] Pas de voix trouvée pour le test."); return False
+
     onnx = os.path.join(voices_dir, f"{test_voice}.onnx")
     if smoke_test_piper(piper_bin, onnx, espeak_env_dir=es_dir):
         print(f"--- Piper prêt (test avec): {test_voice} ---"); return True
     print("[WARN] Piper n’a pas réussi le test audio."); return False
 
 # ========================= Ollama, GGUF, Embeddings =========================
+
 def ensure_ollama_installed_or_upgraded() -> bool:
     if which("ollama"):
         print("--- Ollama présent ---")
         if os.name == "nt" and which("winget"):
-            install_with_progress(["winget","upgrade","Ollama.Ollama","-e", "--accept-package-agreements","--accept-source-agreements"], is_pip=False)
+            install_with_progress(
+                ["winget","upgrade","Ollama.Ollama","-e",
+                 "--accept-package-agreements","--accept-source-agreements"],
+                is_pip=False
+            )
         return True
     print("\n=== Installation d'Ollama ===")
     if os.name == "nt":
-        if which("winget") and install_with_progress(["winget","install","--id=Ollama.Ollama","-e", "--accept-package-agreements","--accept-source-agreements"], is_pip=False): return True
-        if which("choco") and install_with_progress(["choco","install","ollama","-y"], is_pip=False): return True
+        if which("winget") and install_with_progress(
+            ["winget","install","--id=Ollama.Ollama","-e",
+             "--accept-package-agreements","--accept-source-agreements"],
+            is_pip=False
+        ):
+            return True
+        if which("choco") and install_with_progress(["choco","install","ollama","-y"], is_pip=False):
+            return True
         print("Installe manuellement: https://ollama.com/download"); return False
     else:
         print("Linux/macOS: installe via https://ollama.com/download"); return which("ollama") is not None
 
 def ensure_ollama_running(max_wait=40) -> bool:
-    try: import requests
-    except Exception: install_with_progress("requests"); import requests
+    try:
+        import requests
+    except Exception:
+        install_with_progress("requests"); import requests
+
     def ping():
         try:
             r = requests.get("http://127.0.0.1:11434/api/tags", timeout=3)
             return r.status_code == 200
-        except Exception: return False
+        except Exception:
+            return False
+
     if ping(): print("--- Ollama déjà en ligne ---"); return True
     print("--- Démarrage 'ollama serve' ---")
     flags = 0x00000008 | 0x00000200 if os.name == "nt" else 0
-    try: subprocess.Popen(["ollama","serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, creationflags=flags)
-    except Exception as e: print(f"[ERREUR] ollama serve: {e}"); return False
+    try:
+        subprocess.Popen(
+            ["ollama","serve"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            creationflags=flags
+        )
+    except Exception as e:
+        print(f"[ERREUR] ollama serve: {e}"); return False
+
     for _ in range(max_wait):
         if ping(): print("--- Ollama en ligne ---"); return True
         time.sleep(1)
@@ -431,18 +496,28 @@ def ensure_llm_gguf(base_dir="micheline"):
     ensure_dir(os.path.join(base_dir, "models", "llm"))
     preferred = "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
     dest = os.path.join(base_dir, "models", "llm", preferred)
-    if os.path.exists(dest): print(f"--- GGUF déjà présent: {dest} ---"); return True
+    if os.path.exists(dest):
+        print(f"--- GGUF déjà présent: {dest} ---"); return True
+
     token = os.getenv("HF_TOKEN","").strip()
-    if not token: print("[INFO] Pas de HF_TOKEN. Place manuellement le GGUF si besoin."); return False
+    if not token:
+        print("[INFO] Pas de HF_TOKEN. Place manuellement le GGUF si besoin."); return False
+
     if not has_pkg("huggingface_hub"): install_with_progress("huggingface_hub")
     from huggingface_hub import hf_hub_download
     print("--- Téléchargement GGUF via HF Hub ---")
     try:
-        path = hf_hub_download(repo_id="QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF", filename=preferred, token=token, local_dir=os.path.join(base_dir, "models", "llm"))
+        path = hf_hub_download(
+            repo_id="QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF",
+            filename=preferred,
+            token=token,
+            local_dir=os.path.join(base_dir, "models", "llm")
+        )
         ok = os.path.exists(path)
         print(f"--- GGUF {'OK' if ok else 'ECHEC'}: {path} ---")
         return ok
-    except Exception as e: print(f"[WARN] GGUF via HF: {e}"); return False
+    except Exception as e:
+        print(f"[WARN] GGUF via HF: {e}"); return False
 
 def ensure_rag_packages():
     print("\n--- Dépendances RAG ---")
@@ -454,6 +529,7 @@ def ensure_rag_packages():
         if not has_pkg(p): install_with_progress(p)
 
 # ========================= Fine-Tuning (transformers/peft/datasets) =========================
+
 def _install_torch_cpu() -> bool:
     # Installe la version CPU (stable) de torch
     cpu_index = "https://download.pytorch.org/whl/cpu"
@@ -468,7 +544,7 @@ def _install_torch_gpu_cu121() -> bool:
     # Essaie l’index cu121 de PyTorch (NVIDIA). À utiliser seulement si MICHELINE_TORCH_GPU=1
     cu_index = "https://download.pytorch.org/whl/cu121"
     print("\n--- Installation torch (CUDA 12.1) ---")
-    ok = run_stream([sys.executable, "-m", "pip", "install", "--upgrade", "torch", "--index-url", cu_index])
+    run_stream([sys.executable, "-m", "pip", "install", "--upgrade", "torch", "--index-url", cu_index])
     return has_pkg("torch")
 
 def ensure_ft_packages() -> bool:
@@ -498,11 +574,11 @@ def ensure_ft_packages() -> bool:
 
     # 2) Paquets FT essentiels (y compris la dépendance pour Qwen)
     essential_ft_packages = [
-        "transformers", 
-        "peft", 
-        "datasets", 
-        "accelerate", 
-        "transformers_stream_generator" # Ajouté ici
+        "transformers",
+        "peft",
+        "datasets",
+        "accelerate",
+        "transformers_stream_generator"  # Ajouté ici
     ]
     for pkg in essential_ft_packages:
         if not has_pkg(pkg):
@@ -524,13 +600,20 @@ def ensure_ft_packages() -> bool:
 def ensure_embeddings_model(base_dir="micheline", model_id="sentence-transformers/all-MiniLM-L6-v2"):
     print(f"\n--- Téléchargement embeddings: {model_id} ---")
     target_dir = os.path.join(base_dir, "models", "embeddings", "all-MiniLM-L6-v2")
-    if os.path.isdir(target_dir) and os.listdir(target_dir): print(f"--- Embeddings déjà présents -> {target_dir} ---"); return True
+    if os.path.isdir(target_dir) and os.listdir(target_dir):
+        print(f"--- Embeddings déjà présents -> {target_dir} ---"); return True
     if not has_pkg("huggingface_hub"): install_with_progress("huggingface_hub")
     try:
         from huggingface_hub import snapshot_download
-        snapshot_download(repo_id=model_id, local_dir=target_dir, local_dir_use_symlinks=False, ignore_patterns=["*.safetensors.index.json"])
+        snapshot_download(
+            repo_id=model_id,
+            local_dir=target_dir,
+            local_dir_use_symlinks=False,
+            ignore_patterns=["*.safetensors.index.json"]
+        )
         print(f"--- Embeddings téléchargés -> {target_dir} ---"); return True
-    except Exception as e: print(f"[WARN] snapshot_download échoué: {e}"); return False
+    except Exception as e:
+        print(f"[WARN] snapshot_download échoué: {e}"); return False
 
 def smoke_test_embeddings(base_dir="micheline"):
     try:
@@ -539,7 +622,8 @@ def smoke_test_embeddings(base_dir="micheline"):
         m = SentenceTransformer(model_dir if os.path.isdir(model_dir) else "sentence-transformers/all-MiniLM-L6-v2")
         _ = m.encode(["Bonjour le monde"], normalize_embeddings=True)
         print("--- Test embeddings OK ---"); return True
-    except Exception as e: print(f"[WARN] Test embeddings: {e}"); return False
+    except Exception as e:
+        print(f"[WARN] Test embeddings: {e}"); return False
 
 # ========================= main() =========================
 
@@ -548,21 +632,38 @@ def main():
     check_and_fix_numpy()
 
     core_packages = [
-        "pandas","tensorflow","tf-keras","requests","python-dotenv","nltk","pandas_ta",
+        # --- Core / UI / util ---
+        "requests",
+        "python-dotenv",
+        "feedparser",  # <--- AJOUT IMPORTANT (watchers RSS)
+
+        # --- Trading/ML stack (selon ton repo) ---
+        "pandas","tensorflow","tf-keras","nltk","pandas_ta",
         "MetaTrader5","finta","scipy","scikit-learn","numba","mplfinance","arch",
-        "vosk","sounddevice","pyttsx3","Pillow","opencv-python-headless","huggingface_hub"
+
+        # --- Voice / Vision / OCR ---
+        "vosk","sounddevice","pyttsx3","Pillow","opencv-python-headless",
+
+        # --- HF utils ---
+        "huggingface_hub"
     ]
     for p in core_packages:
         if not has_pkg(p): install_with_progress(p)
+
     try:
         import nltk
         print("\n--- NLTK: vader_lexicon ---")
         nltk.download('vader_lexicon', quiet=True)
-    except Exception as e: print(f"[INFO] NLTK ignoré: {e}")
+    except Exception as e:
+        print(f"[INFO] NLTK ignoré: {e}")
 
     ensure_rag_packages()
-    try: ocr_ok = ensure_ocr_dependencies()
-    except Exception as e: print(f"[WARN] OCR: {e}"); ocr_ok = False
+
+    try:
+        ocr_ok = ensure_ocr_dependencies()
+    except Exception as e:
+        print(f"[WARN] OCR: {e}")
+        ocr_ok = False
 
     # Dépendances Fine‑Tuning
     try:
@@ -574,20 +675,30 @@ def main():
     create_micheline_skeleton(base_dir="micheline")
 
     stt_vosk_ok = False
-    try: stt_vosk_ok = ensure_vosk_fr_model(base_dir="micheline")
-    except Exception as e: print(f"[WARN] Vosk: {e}")
+    try:
+        stt_vosk_ok = ensure_vosk_fr_model(base_dir="micheline")
+    except Exception as e:
+        print(f"[WARN] Vosk: {e}")
+
     stt_whisper_ok = False
-    try: stt_whisper_ok = ensure_whisper_cpp(base_dir="micheline")
-    except Exception as e: print(f"[WARN] whisper.cpp: {e}")
+    try:
+        stt_whisper_ok = ensure_whisper_cpp(base_dir="micheline")
+    except Exception as e:
+        print(f"[WARN] whisper.cpp: {e}")
+
     piper_ok = False
-    try: piper_ok = ensure_piper_and_voice(base_dir="micheline")
-    except Exception as e: print(f"[WARN] Piper: {e}")
+    try:
+        piper_ok = ensure_piper_and_voice(base_dir="micheline")
+    except Exception as e:
+        print(f"[WARN] Piper: {e}")
 
     msvc_ok = ensure_visual_cpp_build_tools() if os.name == "nt" else True
     llama_ok = install_llama_cpp_optional() if msvc_ok else False
 
-    try: ensure_llm_gguf(base_dir="micheline")
-    except Exception as e: print(f"[INFO] GGUF: {e}")
+    try:
+        ensure_llm_gguf(base_dir="micheline")
+    except Exception as e:
+        print(f"[INFO] GGUF: {e}")
 
     emb_ok = ensure_embeddings_model(base_dir="micheline")
     smoke_test_embeddings(base_dir="micheline")
