@@ -6,6 +6,9 @@
 # NOTE (petite correction utile):
 # - Ajout de `feedparser` (utilisé par micheline/intel/watchers.py) pour éviter:
 #   ModuleNotFoundError: No module named 'feedparser'
+#
+# NOTE (ajout demandé):
+# - Ajout de `deep-translator` pour la traduction des titres dans l'onglet "News".
 
 import subprocess
 import sys
@@ -427,7 +430,6 @@ def ensure_piper_and_voice(base_dir="micheline"):
     print("[WARN] Piper n’a pas réussi le test audio."); return False
 
 # ========================= Ollama, GGUF, Embeddings =========================
-
 def ensure_ollama_installed_or_upgraded() -> bool:
     if which("ollama"):
         print("--- Ollama présent ---")
@@ -529,9 +531,7 @@ def ensure_rag_packages():
         if not has_pkg(p): install_with_progress(p)
 
 # ========================= Fine-Tuning (transformers/peft/datasets) =========================
-
 def _install_torch_cpu() -> bool:
-    # Installe la version CPU (stable) de torch
     cpu_index = "https://download.pytorch.org/whl/cpu"
     print("\n--- Installation torch (CPU) ---")
     ok = run_stream([sys.executable, "-m", "pip", "install", "--upgrade", "torch", "--index-url", cpu_index])
@@ -541,23 +541,14 @@ def _install_torch_cpu() -> bool:
     return has_pkg("torch")
 
 def _install_torch_gpu_cu121() -> bool:
-    # Essaie l’index cu121 de PyTorch (NVIDIA). À utiliser seulement si MICHELINE_TORCH_GPU=1
     cu_index = "https://download.pytorch.org/whl/cu121"
     print("\n--- Installation torch (CUDA 12.1) ---")
     run_stream([sys.executable, "-m", "pip", "install", "--upgrade", "torch", "--index-url", cu_index])
     return has_pkg("torch")
 
 def ensure_ft_packages() -> bool:
-    """
-    Installe les dépendances Fine‑Tuning:
-      - torch (CPU par défaut; GPU si MICHELINE_TORCH_GPU=1)
-      - transformers, peft, datasets, accelerate, transformers_stream_generator
-      - bitsandbytes (Linux + GPU seulement)
-    Retourne True si l’ensemble minimal est présent.
-    """
     print("\n--- Dépendances Fine‑Tuning (transformers/peft/datasets) ---")
 
-    # 1) torch
     want_gpu = os.getenv("MICHELINE_TORCH_GPU", "0").strip() == "1"
     if not has_pkg("torch"):
         if want_gpu:
@@ -572,13 +563,12 @@ def ensure_ft_packages() -> bool:
     else:
         print("--- torch OK ---")
 
-    # 2) Paquets FT essentiels (y compris la dépendance pour Qwen)
     essential_ft_packages = [
         "transformers",
         "peft",
         "datasets",
         "accelerate",
-        "transformers_stream_generator"  # Ajouté ici
+        "transformers_stream_generator"
     ]
     for pkg in essential_ft_packages:
         if not has_pkg(pkg):
@@ -586,7 +576,6 @@ def ensure_ft_packages() -> bool:
         else:
             print(f"--- {pkg} OK ---")
 
-    # 3) bitsandbytes (optionnel, GPU, Linux uniquement)
     if want_gpu and sys.platform.startswith("linux") and not has_pkg("bitsandbytes"):
         print("\n--- Tentative bitsandbytes (optionnel) ---")
         install_with_progress("bitsandbytes")
@@ -635,17 +624,15 @@ def main():
         # --- Core / UI / util ---
         "requests",
         "python-dotenv",
-        "feedparser",  # <--- AJOUT IMPORTANT (watchers RSS)
+        "feedparser",        # RSS watchers
+        "deep-translator",   # Traduction titres (onglet News)
 
         # --- Trading/ML stack (selon ton repo) ---
         "pandas","tensorflow","tf-keras","nltk","pandas_ta",
         "MetaTrader5","finta","scipy","scikit-learn","numba","mplfinance","arch",
 
         # --- Voice / Vision / OCR ---
-        "vosk","sounddevice","pyttsx3","Pillow","opencv-python-headless",
-
-        # --- HF utils ---
-        "huggingface_hub"
+        "vosk","sounddevice","pyttsx3","Pillow","opencv-python-headless","huggingface_hub"
     ]
     for p in core_packages:
         if not has_pkg(p): install_with_progress(p)
@@ -658,7 +645,6 @@ def main():
         print(f"[INFO] NLTK ignoré: {e}")
 
     ensure_rag_packages()
-
     try:
         ocr_ok = ensure_ocr_dependencies()
     except Exception as e:
