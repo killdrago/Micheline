@@ -2261,40 +2261,95 @@ class App:
         self.cleanup_and_force_retrain(selected_pairs)
 
     def populate_features_tab(self):
-        for w in self.features_tab.winfo_children(): w.destroy()
-        ttk.Label(self.features_tab, text="Indicateurs obligatoires toujours actifs. Choisissez les indicateurs optionnels.", wraplength=800).pack(anchor=tk.W, pady=(0, 15))
-        self.feature_group_vars = {}
+        # Nettoyage onglet
+        for w in self.features_tab.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+        ttk.Label(
+            self.features_tab,
+            text="Indicateurs obligatoires toujours actifs.\nChoisissez les indicateurs optionnels.",
+            wraplength=800
+        ).pack(anchor=tk.W, pady=(0, 15))
+
+        # Charge config
         cfg = config.load_config_data()
+
+        # Vars des options (groupes) sélectionnées
+        self.feature_group_vars = {}
+
+        # Options actives (si absent: tout)
         active_options = cfg.get("active_feature_groups", config.get_all_feature_groups())
+
+        # ------------------ Sélection manuelle ------------------
         manual = ttk.LabelFrame(self.features_tab, text="Sélection Manuelle des Indicateurs Optionnels")
         manual.pack(fill="x", expand=False, pady=5)
+
+        # Petit plus: on stocke tous les widgets manuels ici (pour les désactiver quand auto=ON)
         self.manual_feature_widgets = []
-        all_categories = list(config.CATEGORIZED_FEATURES.keys())
+
+        all_categories = list(getattr(config, "CATEGORIZED_FEATURES", {}).keys())
         num_cols = 3
+
         columns_container = ttk.Frame(manual)
         columns_container.pack(fill="x", expand=True, pady=5, padx=5)
+
         for i in range(num_cols):
             columns_container.columnconfigure(i, weight=1, uniform="group1")
+
             col_frame = ttk.Frame(columns_container)
             col_frame.grid(row=0, column=i, sticky="new", padx=10)
+
             for j in range(i, len(all_categories), num_cols):
                 category = all_categories[j]
-                sub_groups = config.CATEGORIZED_FEATURES[category]
-                ttk.Label(col_frame, text=category, font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(10, 2))
+                sub_groups = config.CATEGORIZED_FEATURES.get(category, [])
+
+                ttk.Label(col_frame, text=category, font=("Segoe UI", 10, "bold")).pack(
+                    anchor=tk.W, pady=(10, 2)
+                )
+
                 for option_name in sub_groups:
                     var = tk.BooleanVar(value=(option_name in active_options))
                     self.feature_group_vars[option_name] = var
-                    chk = ttk.Checkbutton(col_frame, text=option_name, variable=var, takefocus=0)
+
+                    chk = ttk.Checkbutton(
+                        col_frame,
+                        text=option_name,
+                        variable=var,
+                        takefocus=0
+                    )
                     chk.pack(anchor=tk.W, padx=10, pady=2)
+
+                    # Petit plus: on garde une référence pour griser/dégriser
                     self.manual_feature_widgets.append(chk)
+
+        # ------------------ Auto selection ------------------
         auto = ttk.LabelFrame(self.features_tab, text="Optimisation Automatique")
         auto.pack(fill="x", pady=15, padx=0)
-        self.auto_select_var = tk.BooleanVar(value=cfg.get("use_automatic_feature_selection", True))
-        ttk.Checkbutton(auto, text="Activer la sélection auto des indicateurs (par paire)", variable=self.auto_select_var, command=self.toggle_feature_selection, takefocus=0).pack(anchor=tk.W, padx=10, pady=5)
-        ttk.Separator(self.features_tab, orient="horizontal").pack(fill="x", pady=15)
-        ttk.Button(self.features_tab, text="Appliquer et Redémarrer", command=self.save_features_config).pack(anchor=tk.W, pady=10)
-        self.toggle_feature_selection()
 
+        self.auto_select_var = tk.BooleanVar(value=cfg.get("use_automatic_feature_selection", True))
+
+        ttk.Checkbutton(
+            auto,
+            text="Activer la sélection auto des indicateurs (par paire)",
+            variable=self.auto_select_var,
+            command=self.toggle_feature_selection,
+            takefocus=0
+        ).pack(anchor=tk.W, padx=10, pady=5)
+
+        ttk.Separator(self.features_tab, orient="horizontal").pack(fill="x", pady=15)
+
+        ttk.Button(
+            self.features_tab,
+            text="Appliquer et Redémarrer",
+            command=self.save_features_config
+        ).pack(anchor=tk.W, pady=10)
+
+        # Applique l'état ON/OFF au démarrage (griser/dégriser)
+        self.toggle_feature_selection()
+    
     def save_features_config(self):
         cfg = config.load_config_data()
         cfg["use_automatic_feature_selection"] = self.auto_select_var.get()
@@ -5049,58 +5104,63 @@ class App:
             self.root.destroy()
         except Exception:
             pass        
-        def toggle_feature_selection(self):
-            state = "disabled" if self.auto_select_var.get() else "normal"
-            for widget in self.manual_feature_widgets:
-                widget.config(state=state)
-    
+
+    def toggle_feature_selection(self):
+        """
+        Grise/dégrise la sélection manuelle quand l'option auto est activée.
+        (Sinon: AttributeError au démarrage, car populate_features_tab référence cette méthode.)
+        """
+        try:
+            auto_on = bool(self.auto_select_var.get())
+        except Exception:
+            auto_on = False
+
+        widgets = getattr(self, "manual_feature_widgets", []) or []
+        for w in widgets:
+            try:
+                # ttk widgets
+                if auto_on:
+                    w.state(["disabled"])
+                else:
+                    w.state(["!disabled"])
+            except Exception:
+                # fallback tk
+                try:
+                    w.configure(state=("disabled" if auto_on else "normal"))
+                except Exception:
+                    pass
+                
     def _start_watcher_service(self):
-        # Toujours safe: on initialise même si ça échoue
         self.watcher_service = None
         self._watcher_thread = None
 
         try:
             from micheline.intel.watchers import WatcherService
+            from micheline.intel.entity_registry import EntityRegistry, seed_default_entities
         except Exception as e:
             print("[WATCHERS] Import impossible:", e)
             return False
 
+        # Seed auto si registry vide
         try:
-            # IMPORTANT:
-            # on_read = self.news_log_read => le watcher "pousse" les lectures dans l'onglet News
-            self.watcher_service = WatcherService(
-                registry_path="micheline/intel/entities.json",
-                db_path="micheline/intel/db/news_reads.sqlite",
-                poll_interval_sec=120,
-                on_read=self.news_log_read
-            )
+            registry = EntityRegistry()
+            if not registry.list_all_active_sources():
+                print("[WATCHERS] Registry vide -> seed_default_entities()")
+                seed_default_entities()
+                print("[WATCHERS] ✅ Registry initialisé.")
         except Exception as e:
-            print("[WATCHERS] Init WatcherService impossible:", e)
-            self.watcher_service = None
-            return False
+            print("[WATCHERS] Seed registry a échoué:", e)
 
+        # Start watcher
         try:
-            self.watcher_service.start()
+            self.watcher_service = WatcherService()
+            self.watcher_service.start()  # start thread (daemon par défaut)
             print("[WATCHERS] Démarré via .start()")
             return True
         except Exception as e:
             print("[WATCHERS] start() a échoué:", e)
+            self.watcher_service = None
             return False
-
-        def _stop_watcher_service(self):
-            try:
-                ws = getattr(self, "watcher_service", None)
-                if ws is None:
-                    return
-                if hasattr(ws, "stop"):
-                    ws.stop()
-                elif hasattr(ws, "shutdown"):
-                    ws.shutdown()
-            except Exception as e:
-                print("[WATCHERS] stop error:", e)
-            finally:
-                self.watcher_service = None
-                self._watcher_thread = None
     
     def _refresh_attachments_bar(self):
         # Efface l’ancien contenu
