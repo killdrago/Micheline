@@ -1,355 +1,796 @@
+# micheline/intel/watchers.py
+# Service de surveillance continue des sources (RSS/web/social/official_doc)
+# - Poll périodique basé sur le registry (EntityRegistry SQLite)
+# - Respect robots.txt (tolérant en cas d'erreur)
+# - Rate limiting par domaine
+# - Extraction + stockage en "raw events" (SQLite)
+# - Callback optionnel (on_item) pour pousser les lectures vers l'UI (onglet News)
+# - Rétention (ex: 7 jours) + purge automatique
+# - Replay au démarrage avec timestamp ORIGINAL (fetched_at) => l'heure affichée reste correcte après redémarrage
+
+from __future__ import annotations
+
 import os
-import json
 import time
-import threading
+import json
+import uuid
+import hashlib
 import sqlite3
-from dataclasses import dataclass
-from typing import Callable, Optional, List, Dict, Any
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+import threading
+from typing import Optional, List, Dict, Any, Callable
+from datetime import datetime
+from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
 
 import requests
 import feedparser
 
+try:
+    import certifi
+except Exception:
+    certifi = None
 
-# -------------------------
-# Helpers
-# -------------------------
+try:
+    import trafilatura
+except Exception:
+    trafilatura = None
 
-_TRACKING_PARAMS = {
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "gclid", "fbclid", "mc_cid", "mc_eid", "ref", "ref_src"
-}
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
 
-def canonicalize_url(url: str) -> str:
-    """Supprime les paramètres de tracking, normalise un peu l’URL."""
-    try:
-        url = (url or "").strip()
-        if not url:
-            return ""
-        p = urlparse(url)
-        q = [(k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=True) if k not in _TRACKING_PARAMS]
-        new_query = urlencode(q, doseq=True)
-        # Normalisation simple : retire fragment, garde scheme/netloc/path/query
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, ""))
-    except Exception:
-        return (url or "").strip()
+import config
+from micheline.intel.entity_registry import EntityRegistry
 
-def get_site_from_url(url: str) -> str:
+
+# ==========================
+# Constantes / chemins
+# ==========================
+
+EVENTS_DB_PATH = os.path.join(os.path.dirname(__file__), "db", "raw_events.sqlite")
+
+DEFAULT_UA = getattr(
+    config,
+    "WATCHER_USER_AGENT",
+    "MichelineBot/1.0 (Intelligence Gathering)",
+)
+
+# Env: 0 => désactive verify SSL (pas recommandé)
+SSL_VERIFY = os.getenv("MICHELINE_SSL_VERIFY", "1").strip() != "0"
+
+
+# ==========================
+# Utils
+# ==========================
+
+def _now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _sha256(s: str) -> str:
+    return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
+
+def _domain(url: str) -> str:
     try:
         return urlparse(url).netloc.lower()
     except Exception:
         return ""
 
+def _safe_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return "{}"
 
-# -------------------------
-# Registry model
-# -------------------------
+def _requests_verify_value() -> Any:
+    """
+    verify= pour requests:
+    - False si MICHELINE_SSL_VERIFY=0
+    - sinon certifi.where() si dispo
+    - sinon True
+    """
+    if not SSL_VERIFY:
+        return False
+    if certifi is not None:
+        try:
+            return certifi.where()
+        except Exception:
+            pass
+    return True
 
-@dataclass
-class WatchSource:
-    url: str
-    type: str = "rss"             # "rss" (pour l’instant)
-    active: bool = True
-    label: str = ""               # nom sympa affiché si tu veux
-    entity_id: str = ""           # optionnel
-    poll_interval_sec: int = 0    # 0 => utilise l’intervalle global
+
+# ==========================
+# URL Rewrites (sources "propres" vs robots.txt)
+# ==========================
+
+TRUMP_TRUTH_RSS = "https://trumpstruth.org/feed"
+
+# RSS Google News (évite de scraper opec.org directement si robots bloque)
+OPEC_GOOGLE_NEWS_RSS = (
+    "https://news.google.com/rss/search?"
+    "q=site%3Aopec.org%20press%20releases&hl=en-US&gl=US&ceid=US:en"
+)
+
+def _rewrite_source_if_needed(source_type: str, url: str) -> (str, str, str):
+    st = (source_type or "").lower().strip()
+    u = (url or "").strip()
+    ul = u.lower()
+
+    # Trump: TruthSocial / RSSHub -> trumpstruth RSS (public)
+    if "truthsocial.com/@realdonaldtrump" in ul:
+        return ("rss", TRUMP_TRUTH_RSS, "TruthSocial bloqué robots -> trumpstruth RSS")
+    if "rsshub.app/truthsocial/realdonaldtrump" in ul:
+        return ("rss", TRUMP_TRUTH_RSS, "RSSHub bloqué robots -> trumpstruth RSS")
+
+    # OPEC press_room -> Google News RSS (site:opec.org)
+    if "opec.org/opec_web/en/press_room/" in ul:
+        return ("rss", OPEC_GOOGLE_NEWS_RSS, "OPEC press_room bloqué robots -> Google News RSS")
+
+    return (st or source_type, u, "")
 
 
-# -------------------------
-# Watcher Service
-# -------------------------
+# ==========================
+# Rate Limiter
+# ==========================
+
+class RateLimiter:
+    def __init__(self, min_interval_sec: float = 2.0):
+        self.min_interval = float(min_interval_sec or 0.0)
+        self._last_access: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def wait_if_needed(self, domain: str):
+        if not self.min_interval or not domain:
+            return
+        with self._lock:
+            last = self._last_access.get(domain, 0.0)
+            now = time.time()
+            elapsed = now - last
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self._last_access[domain] = time.time()
+
+
+# ==========================
+# Robots checker
+# ==========================
+
+class RobotsChecker:
+    def __init__(self, user_agent: str = None):
+        self.user_agent = user_agent or DEFAULT_UA
+        self._parsers: Dict[str, RobotFileParser] = {}
+        self._lock = threading.Lock()
+
+    def can_fetch(self, url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            if not parsed.scheme or not parsed.netloc:
+                return True
+
+            with self._lock:
+                rp = self._parsers.get(base_url)
+                if rp is None:
+                    rp = RobotFileParser()
+                    rp.set_url(f"{base_url}/robots.txt")
+                    try:
+                        rp.read()
+                    except Exception as e:
+                        print(f"[Robots] Erreur lecture robots.txt pour {base_url}: {e}")
+                        return True
+                    self._parsers[base_url] = rp
+
+            parser = self._parsers.get(base_url)
+            if parser:
+                return parser.can_fetch(self.user_agent, url)
+            return True
+        except Exception as e:
+            print(f"[Robots] Erreur vérification {url}: {e}")
+            return True
+
+
+# ==========================
+# RawEventsDB (persist + rétention + replay)
+# ==========================
+
+class RawEventsDB:
+    def __init__(self, db_path: str = EVENTS_DB_PATH):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._init_db()
+
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            pass
+        return conn
+
+    def _ensure_column(self, conn, table: str, col: str, coltype: str):
+        try:
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if col not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+                conn.commit()
+                print(f"[RawEventsDB] Migration: ajout colonne {table}.{col}")
+        except Exception as e:
+            print(f"[RawEventsDB] Migration colonne échouée ({table}.{col}): {e}")
+
+    def _init_db(self):
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS raw_events (
+                    event_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL UNIQUE,
+
+                    source_id INTEGER,
+                    entity_id TEXT,
+
+                    source_url TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+
+                    title TEXT,
+                    content TEXT NOT NULL,
+
+                    published_at TEXT,
+                    fetched_at TEXT NOT NULL,
+
+                    url TEXT,
+                    metadata TEXT,
+
+                    is_processed INTEGER DEFAULT 0,
+                    processing_status TEXT
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_events_fetched_at ON raw_events(fetched_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_events_entity_id ON raw_events(entity_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_events_processed ON raw_events(is_processed)")
+            conn.commit()
+
+            # Migration auto (si DB ancienne)
+            self._ensure_column(conn, "raw_events", "url", "TEXT")
+            self._ensure_column(conn, "raw_events", "metadata", "TEXT")
+            self._ensure_column(conn, "raw_events", "published_at", "TEXT")
+            self._ensure_column(conn, "raw_events", "processing_status", "TEXT")
+
+    def insert_if_new(self, event: Dict[str, Any]) -> bool:
+        try:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO raw_events (
+                        event_id, content_hash,
+                        source_id, entity_id,
+                        source_url, source_type,
+                        title, content,
+                        published_at, fetched_at,
+                        url, metadata,
+                        is_processed, processing_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.get("event_id"),
+                        event.get("content_hash"),
+                        event.get("source_id"),
+                        event.get("entity_id"),
+                        event.get("source_url"),
+                        event.get("source_type"),
+                        event.get("title"),
+                        event.get("content"),
+                        event.get("published_at"),
+                        event.get("fetched_at"),
+                        event.get("url"),
+                        event.get("metadata"),
+                        int(event.get("is_processed", 0)),
+                        event.get("processing_status"),
+                    ),
+                )
+                conn.commit()
+                return True
+        except sqlite3.IntegrityError:
+            return False
+        except Exception as e:
+            print(f"[RawEventsDB] Erreur insertion: {e}")
+            return False
+
+    def purge_older_than_days(self, days: int = 7) -> int:
+        """Supprime les raw_events dont fetched_at est plus vieux que N jours."""
+        try:
+            days = int(days)
+            if days <= 0:
+                return 0
+        except Exception:
+            days = 7
+
+        try:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    "DELETE FROM raw_events WHERE fetched_at < datetime('now', ?)",
+                    (f"-{days} days",),
+                )
+                deleted = cur.rowcount if cur.rowcount is not None else 0
+                conn.commit()
+                if deleted:
+                    print(f"[RawEventsDB] Purge: {deleted} event(s) supprimé(s) (> {days} jours)")
+                return int(deleted)
+        except Exception as e:
+            print(f"[RawEventsDB] Purge erreur: {e}")
+            return 0
+
+    def list_recent_for_ui(self, days: int = 7, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Retourne des items récents pour re-remplir l'onglet News au démarrage.
+        IMPORTANT: on renvoie 'read_at' = fetched_at (original).
+        """
+        try:
+            days = int(days)
+        except Exception:
+            days = 7
+        try:
+            limit = int(limit)
+        except Exception:
+            limit = 500
+
+        try:
+            with self._get_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT fetched_at, title, url, source_url, metadata
+                    FROM raw_events
+                    WHERE fetched_at >= datetime('now', ?)
+                    ORDER BY fetched_at DESC
+                    LIMIT ?
+                    """,
+                    (f"-{days} days", limit),
+                ).fetchall()
+
+            out = []
+            for r in rows:
+                meta = {}
+                try:
+                    meta = json.loads(r["metadata"] or "{}")
+                except Exception:
+                    meta = {}
+
+                url = (r["url"] or r["source_url"] or "").strip()
+                site = (meta.get("domain") or _domain(url) or _domain(r["source_url"] or "") or "unknown").strip()
+                title = (r["title"] or "").strip() or "(sans titre)"
+
+                out.append(
+                    {
+                        "read_at": r["fetched_at"],  # <- timestamp original
+                        "site": site,
+                        "title": title,
+                        "url": url,
+                    }
+                )
+            return out
+        except Exception as e:
+            print(f"[RawEventsDB] Erreur list_recent_for_ui: {e}")
+            return []
+
+
+# ==========================
+# Watcher (1 source)
+# ==========================
+
+class Watcher:
+    def __init__(
+        self,
+        source: Dict[str, Any],
+        rate_limiter: RateLimiter,
+        robots_checker: RobotsChecker,
+        user_agent: str = None,
+        timeout_sec: int = 20,
+    ):
+        self.source = source
+        self.source_id = source.get("source_id")
+        self.entity_id = source.get("entity_id")
+        self.entity_name = source.get("entity_name", "")
+        self.source_type = (source.get("source_type") or "rss").lower()
+        self.url = source.get("url", "")
+        self.user_agent = user_agent or DEFAULT_UA
+        self.timeout_sec = int(timeout_sec or 20)
+
+        self.rate_limiter = rate_limiter
+        self.robots_checker = robots_checker
+
+    def fetch(self) -> List[Dict[str, Any]]:
+        if not self.url:
+            return []
+
+        # Rewrite automatique (robots / sources cassées)
+        new_type, new_url, reason = _rewrite_source_if_needed(self.source_type, self.url)
+        if reason and new_url and (new_url != self.url or new_type != self.source_type):
+            print(f"[Watcher] Rewrite source: {self.url} -> {new_url} ({reason})")
+            self.url = new_url
+            self.source_type = new_type
+
+        if not self.robots_checker.can_fetch(self.url):
+            print(f"[Watcher] robots.txt interdit: {self.url}")
+            return []
+
+        st = self.source_type
+        if st == "rss":
+            return self._fetch_rss()
+        if st in ("website", "official_doc"):
+            return self._fetch_webpage()
+        if st == "social":
+            return self._fetch_social()
+
+        return self._fetch_rss()
+
+    def _http_get(self, url: str) -> requests.Response:
+        headers = {"User-Agent": self.user_agent}
+        self.rate_limiter.wait_if_needed(_domain(url))
+        return requests.get(
+            url,
+            headers=headers,
+            timeout=self.timeout_sec,
+            verify=_requests_verify_value(),
+        )
+
+    def _extract_text_from_html(self, html: str, url: str = "") -> str:
+        if trafilatura is not None:
+            try:
+                txt = trafilatura.extract(html, include_comments=False, include_tables=False)
+                if txt and txt.strip():
+                    return txt.strip()
+            except Exception:
+                pass
+
+        if BeautifulSoup is not None:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                for tag in soup(["script", "style", "noscript"]):
+                    tag.decompose()
+                txt = soup.get_text("\n")
+                txt = "\n".join(line.strip() for line in txt.splitlines() if line.strip())
+                return txt.strip()
+            except Exception:
+                pass
+
+        return (html or "").strip()
+
+    def _make_event(
+        self,
+        title: str,
+        content: str,
+        published_at: Optional[str],
+        item_url: Optional[str],
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        fetched_at = _now_str()
+        item_url = (item_url or "").strip()
+        content = (content or "").strip()
+        title = (title or "").strip()
+
+        basis = f"{self.entity_id}|{self.source_id}|{self.source_type}|{item_url}|{title}|{content[:2000]}"
+        content_hash = _sha256(basis)
+
+        meta = {"entity_name": self.entity_name, "domain": _domain(item_url or self.url)}
+        if extra_meta:
+            meta.update(extra_meta)
+
+        return {
+            "event_id": str(uuid.uuid4()),
+            "content_hash": content_hash,
+            "source_id": self.source_id,
+            "entity_id": self.entity_id,
+            "source_url": self.url,
+            "source_type": self.source_type,
+            "title": title,
+            "content": content,
+            "published_at": published_at,
+            "fetched_at": fetched_at,
+            "url": item_url or self.url,
+            "metadata": _safe_json(meta),
+            "is_processed": 0,
+            "processing_status": None,
+        }
+
+    def _fetch_rss(self) -> List[Dict[str, Any]]:
+        try:
+            r = self._http_get(self.url)
+            r.raise_for_status()
+
+            feed = feedparser.parse(r.content)
+            entries = getattr(feed, "entries", []) or []
+            out: List[Dict[str, Any]] = []
+
+            fetch_full = bool(getattr(config, "WATCHER_RSS_FETCH_FULL_ARTICLE", False))
+            max_items = int(getattr(config, "WATCHER_RSS_MAX_ITEMS", 30))
+
+            for e in entries[:max_items]:
+                title = (getattr(e, "title", "") or "").strip()
+                link = (getattr(e, "link", "") or "").strip()
+                published = (getattr(e, "published", "") or "").strip() or (getattr(e, "updated", "") or "").strip()
+
+                summary = (getattr(e, "summary", "") or "").strip()
+                content = summary
+
+                try:
+                    if hasattr(e, "content") and e.content:
+                        content_val = e.content[0].value
+                        if isinstance(content_val, str) and content_val.strip():
+                            content = content_val
+                except Exception:
+                    pass
+
+                if fetch_full and link and self.robots_checker.can_fetch(link):
+                    try:
+                        rr = self._http_get(link)
+                        if rr.status_code < 400:
+                            extracted = self._extract_text_from_html(rr.text, url=link)
+                            if extracted and len(extracted) > 200:
+                                content = extracted
+                    except Exception:
+                        pass
+
+                if not content:
+                    continue
+
+                out.append(
+                    self._make_event(
+                        title=title,
+                        content=content,
+                        published_at=published or None,
+                        item_url=link or self.url,
+                        extra_meta={"rss_url": self.url},
+                    )
+                )
+
+            return out
+        except Exception as e:
+            print(f"[WatcherService] Source error ({self.url}): {e}")
+            return []
+
+    def _fetch_webpage(self) -> List[Dict[str, Any]]:
+        try:
+            r = self._http_get(self.url)
+            r.raise_for_status()
+
+            text = self._extract_text_from_html(r.text, url=self.url)
+            if not text:
+                return []
+
+            title = ""
+            if BeautifulSoup is not None:
+                try:
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    if soup.title and soup.title.text:
+                        title = soup.title.text.strip()
+                except Exception:
+                    pass
+
+            return [
+                self._make_event(
+                    title=title or f"Website: {self.url}",
+                    content=text,
+                    published_at=None,
+                    item_url=self.url,
+                    extra_meta={"content_length": len(text)},
+                )
+            ]
+        except Exception as e:
+            print(f"[Watcher] ❌ Erreur fetch web {self.url}: {e}")
+            return []
+
+    def _fetch_social(self) -> List[Dict[str, Any]]:
+        u = (self.url or "").lower()
+        if "rss" in u or "feed" in u:
+            return self._fetch_rss()
+        print("[Watcher] ℹ️ Social: utiliser un flux RSS dédié recommandé")
+        return []
+
+
+# ==========================
+# WatcherService
+# ==========================
 
 class WatcherService:
     """
-    Watcher always-on (RSS) :
-    - lit un registry JSON
-    - poll les RSS
-    - dédup en SQLite
-    - appelle on_read(site, title, url) quand il découvre un nouvel article
+    - Poll les sources actives dans EntityRegistry (SQLite)
+    - Stocke dans raw_events.sqlite
+    - Purge > WATCHER_RETENTION_DAYS (par défaut 7)
+    - Replay au démarrage avec timestamp ORIGINAL (fetched_at) => UI cohérente
     """
 
-    def __init__(
-        self,
-        registry_path: str = "micheline/intel/entities.json",
-        db_path: str = "micheline/intel/db/news_reads.sqlite",
-        poll_interval_sec: int = 120,
-        on_read: Optional[Callable[[str, str, str], None]] = None,
-        user_agent: str = "MichelineWatcher/1.0",
-        timeout_sec: int = 20,
-    ):
-        self.registry_path = registry_path
-        self.db_path = db_path
-        self.poll_interval_sec = int(poll_interval_sec or 120)
-        self.on_read = on_read
-        self.user_agent = user_agent
-        self.timeout_sec = int(timeout_sec or 20)
+    def __init__(self, on_item: Optional[Callable[..., None]] = None):
+        self.registry = EntityRegistry()
+        self.events_db = RawEventsDB()
 
-        self._stop_event = threading.Event()
+        self.rate_limiter = RateLimiter(min_interval_sec=float(getattr(config, "WATCHER_RATE_LIMIT_SEC", 2.0)))
+        self.robots_checker = RobotsChecker()
+
+        self.on_item = on_item
+        self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
-        # évite de spammer "aucune source active" à chaque tick
-        self._last_no_sources_log = 0.0
+        self.poll_intervals = {
+            "rss": int(getattr(config, "WATCHER_RSS_INTERVAL_MIN", 5)),
+            "website": int(getattr(config, "WATCHER_WEB_INTERVAL_MIN", 15)),
+            "official_doc": int(getattr(config, "WATCHER_OFFICIAL_INTERVAL_MIN", 30)),
+            "social": int(getattr(config, "WATCHER_SOCIAL_INTERVAL_MIN", 3)),
+        }
 
-        self._ensure_db()
+        self._last_poll: Dict[int, float] = {}
 
-    # ------------- lifecycle -------------
+        # Rétention / purge
+        self.retention_days = int(getattr(config, "WATCHER_RETENTION_DAYS", 7))
+        self.purge_every_sec = int(getattr(config, "WATCHER_PURGE_EVERY_SEC", 3600))
+        self._last_purge_ts = 0.0
 
-    def start(self) -> None:
-        """Démarre la boucle dans un thread daemon."""
-        if self._thread and self._thread.is_alive():
-            print("[WatcherService] (start) déjà démarré.")
+        # Replay UI
+        self._replayed_recent = False
+        self.replay_limit = int(getattr(config, "WATCHER_REPLAY_LIMIT", 500))
+
+    def start(self, daemon: bool = True):
+        if self._running:
+            print("[WatcherService] Déjà en cours d'exécution.")
             return
 
+        self._running = True
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self.run_forever, daemon=True)
-        self._thread.start()
 
+        # Replay des news persistées (pour que l'onglet "News" survive aux redémarrages)
+        self._replay_recent_news_once()
+
+        self._thread = threading.Thread(target=self._run_loop, daemon=daemon)
+        self._thread.start()
         print("[WatcherService] ✅ Service de surveillance démarré.")
 
-    def stop(self) -> None:
-        """Arrête la boucle."""
+    def stop(self):
         self._stop_event.set()
+        self._running = False
         try:
             if self._thread and self._thread.is_alive():
                 self._thread.join(timeout=2.0)
         except Exception:
             pass
 
-    def run_forever(self) -> None:
+    def _run_loop(self):
         print("[WatcherService] Boucle de surveillance active.")
         while not self._stop_event.is_set():
-            t0 = time.time()
             try:
                 self.poll_once()
             except Exception as e:
-                print("[WatcherService] Erreur poll_once:", e)
+                print(f"[WatcherService] Erreur boucle: {e}")
+            self._stop_event.wait(2.0)
 
-            elapsed = time.time() - t0
-            sleep_s = max(2.0, float(self.poll_interval_sec) - elapsed)
-            # attend (interruptible)
-            self._stop_event.wait(sleep_s)
+    def _maybe_purge(self):
+        try:
+            now_ts = time.time()
+            if (now_ts - self._last_purge_ts) >= max(60, self.purge_every_sec):
+                self.events_db.purge_older_than_days(self.retention_days)
+                self._last_purge_ts = now_ts
+        except Exception:
+            pass
 
-    # ------------- core -------------
+    def _replay_recent_news_once(self):
+        if self._replayed_recent:
+            return
+        self._replayed_recent = True
 
-    def poll_once(self) -> None:
-        sources = self._load_registry_sources()
-
-        active_sources = [s for s in sources if s.active and s.url]
-        if not active_sources:
-            now = time.time()
-            if now - self._last_no_sources_log > 30:  # log au max toutes les 30s
-                print("[WatcherService] Aucune source active dans le registry.")
-                self._last_no_sources_log = now
+        if not callable(self.on_item):
             return
 
-        # On poll chaque source (RSS)
-        for src in active_sources:
-            if self._stop_event.is_set():
-                return
-            try:
-                if (src.type or "").lower() == "rss":
-                    self._poll_rss(src)
-                else:
-                    # tu peux rajouter d'autres types plus tard ("page", "pdf", etc.)
+        try:
+            items = self.events_db.list_recent_for_ui(days=self.retention_days, limit=self.replay_limit)
+            # items est en DESC, on l'envoie en chrono (vieux -> récent) pour l'UI
+            items = list(reversed(items))
+
+            sent = 0
+            for it in items:
+                # IMPORTANT: on envoie fetched_at ORIGINAL via un "event" minimal
+                ev = {"fetched_at": it.get("read_at")}
+                try:
+                    self.on_item(it["site"], it["title"], it["url"], ev)
+                except TypeError:
+                    # compat ancien callback (3 args)
+                    try:
+                        self.on_item(it["site"], it["title"], it["url"])
+                    except Exception:
+                        pass
+                except Exception:
                     pass
-            except Exception as e:
-                print(f"[WatcherService] Source error ({src.url}):", e)
+                sent += 1
 
-    def _poll_rss(self, src: WatchSource) -> None:
-        headers = {"User-Agent": self.user_agent}
-        r = requests.get(src.url, headers=headers, timeout=self.timeout_sec)
-        r.raise_for_status()
+            if sent:
+                print(f"[WatcherService] Replay UI: {sent} news (<= {self.retention_days} jours)")
+        except Exception as e:
+            print(f"[WatcherService] Replay UI error: {e}")
 
-        feed = feedparser.parse(r.content)
-        entries = getattr(feed, "entries", []) or []
+    def poll_once(self):
+        # Purge périodique (rétention)
+        self._maybe_purge()
 
-        # petite info utile en debug
-        # print(f"[WatcherService] RSS {src.url} -> {len(entries)} items")
+        sources = self.registry.list_all_active_sources()
+        if not sources:
+            print("[WatcherService] Aucune source active dans le registry.")
+            self._stop_event.wait(60.0)
+            return
 
-        for e in entries:
+        now = time.time()
+
+        for src in sources:
             if self._stop_event.is_set():
                 return
 
-            title = (getattr(e, "title", "") or "").strip()
-            link = (getattr(e, "link", "") or "").strip()
+            st = (src.get("source_type") or "rss").lower()
+            interval_min = int(self.poll_intervals.get(st, 10))
+            interval_sec = max(15, interval_min * 60)
 
-            if not link:
+            sid = src.get("source_id")
+            if sid is None:
+                due = True
+            else:
+                last = self._last_poll.get(int(sid), 0.0)
+                due = (now - last) >= interval_sec
+
+            if not due:
                 continue
 
-            canon = canonicalize_url(link)
-            site = get_site_from_url(canon) or get_site_from_url(link) or (src.label or "")
-
-            published = ""
-            # feedparser fournit souvent published / updated, on garde textuel (simple)
-            published = (getattr(e, "published", "") or "").strip() or (getattr(e, "updated", "") or "").strip()
-
-            # insert en base si nouveau
-            is_new = self._db_insert_if_new(
-                url=link,
-                canonical_url=canon,
-                title=title,
-                site=site,
-                published_at=published,
-                source_url=src.url,
-                entity_id=src.entity_id
-            )
-
-            if is_new:
-                # callback UI (ton onglet News)
-                self._emit_read(site=site, title=title, url=canon or link)
-
-    def _emit_read(self, site: str, title: str, url: str) -> None:
-        if callable(self.on_read):
             try:
-                self.on_read(site, title, url)
-            except Exception:
-                # ne pas casser la boucle si l'UI a un souci
+                watcher = Watcher(
+                    source=src,
+                    rate_limiter=self.rate_limiter,
+                    robots_checker=self.robots_checker,
+                    user_agent=DEFAULT_UA,
+                    timeout_sec=int(getattr(config, "WATCHER_TIMEOUT_SEC", 20)),
+                )
+                events = watcher.fetch()
+            except Exception as e:
+                print(f"[WatcherService] Erreur watcher pour {src.get('url')}: {e}")
+                events = []
+
+            if sid is not None:
+                self._last_poll[int(sid)] = time.time()
+
+            for ev in events:
+                if self._stop_event.is_set():
+                    return
+
+                inserted = self.events_db.insert_if_new(ev)
+                if not inserted:
+                    continue
+
+                t = (ev.get("title") or "").strip()
+                u = (ev.get("url") or ev.get("source_url") or "").strip()
+                print(f"[Watcher] ✅ New raw event: {t[:120]} | {u}")
+
+                self._emit_ui(ev)
+
+    def _emit_ui(self, ev: Dict[str, Any]):
+        if not callable(self.on_item):
+            return
+        try:
+            url = (ev.get("url") or ev.get("source_url") or "").strip()
+            site = _domain(url) or _domain(ev.get("source_url", "")) or "unknown"
+            title = (ev.get("title") or "").strip() or "(sans titre)"
+
+            # Supporte on_item(site,title,url,event) ou on_item(site,title,url)
+            try:
+                self.on_item(site, title, url, ev)
+                return
+            except TypeError:
                 pass
 
-    # ------------- registry -------------
-
-    def _load_registry_sources(self) -> List[WatchSource]:
-        """
-        Supporte un registry JSON souple :
-        - top-level "sources": [...]
-        - ou top-level "entities": [{..., "sources":[...]}]
-        Chaque source peut être:
-          {"url": "...", "type":"rss", "active": true, "label":"...", "entity_id":"..."}
-        """
-        path = self.registry_path
-
-        if not os.path.exists(path):
-            # pas d'erreur, juste aucune source
-            return []
-
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            print("[WatcherService] Registry illisible:", e)
-            return []
-
-        out: List[WatchSource] = []
-
-        # 1) sources globales
-        if isinstance(data, dict) and isinstance(data.get("sources"), list):
-            out.extend(self._parse_sources_list(data["sources"], default_entity_id=""))
-
-        # 2) sources par entité
-        if isinstance(data, dict) and isinstance(data.get("entities"), list):
-            for ent in data["entities"]:
-                if not isinstance(ent, dict):
-                    continue
-                ent_id = (ent.get("entity_id") or ent.get("id") or "").strip()
-                sources = ent.get("sources")
-                if isinstance(sources, list):
-                    out.extend(self._parse_sources_list(sources, default_entity_id=ent_id))
-
-        # si rien trouvé mais data est déjà une liste -> tolérance
-        if not out and isinstance(data, list):
-            out.extend(self._parse_sources_list(data, default_entity_id=""))
-
-        # petite normalisation
-        cleaned = []
-        for s in out:
-            if not s.url:
-                continue
-            if not s.type:
-                s.type = "rss"
-            cleaned.append(s)
-        return cleaned
-
-    def _parse_sources_list(self, sources: List[Any], default_entity_id: str = "") -> List[WatchSource]:
-        out: List[WatchSource] = []
-        for s in sources:
-            if isinstance(s, str):
-                out.append(WatchSource(url=s, type="rss", active=True, entity_id=default_entity_id))
-                continue
-            if not isinstance(s, dict):
-                continue
-
-            url = (s.get("url") or s.get("link") or "").strip()
-            if not url:
-                continue
-
-            stype = (s.get("type") or "rss").strip().lower()
-            active = bool(s.get("active", True))
-            label = (s.get("label") or s.get("name") or "").strip()
-            entity_id = (s.get("entity_id") or default_entity_id or "").strip()
-
-            poll = 0
             try:
-                poll = int(s.get("poll_interval_sec") or 0)
-            except Exception:
-                poll = 0
+                self.on_item(site, title, url)
+                return
+            except TypeError:
+                pass
 
-            out.append(WatchSource(
-                url=url,
-                type=stype,
-                active=active,
-                label=label,
-                entity_id=entity_id,
-                poll_interval_sec=poll,
-            ))
-        return out
+            self.on_item({"site": site, "title": title, "url": url, "event": ev})
+        except Exception:
+            pass
 
-    # ------------- sqlite -------------
 
-    def _ensure_db(self) -> None:
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        con = sqlite3.connect(self.db_path)
-        try:
-            cur = con.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS news_reads (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    fetched_at TEXT NOT NULL,
-                    source_url TEXT,
-                    entity_id TEXT,
-                    site TEXT,
-                    title TEXT,
-                    url TEXT NOT NULL,
-                    canonical_url TEXT,
-                    published_at TEXT
-                )
-            """)
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_news_reads_url ON news_reads(url)")
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_news_reads_canon ON news_reads(canonical_url)")
-            cur.execute("CREATE INDEX IF NOT EXISTS ix_news_reads_fetched_at ON news_reads(fetched_at)")
-            con.commit()
-        finally:
-            con.close()
-
-    def _db_insert_if_new(
-        self,
-        url: str,
-        canonical_url: str,
-        title: str,
-        site: str,
-        published_at: str,
-        source_url: str,
-        entity_id: str
-    ) -> bool:
-        """
-        Retourne True si c'était nouveau (donc inséré), False si déjà vu.
-        """
-        fetched_at = time.strftime("%Y-%m-%d %H:%M:%S")
-        url = (url or "").strip()
-        canonical_url = (canonical_url or "").strip()
-
-        con = sqlite3.connect(self.db_path)
-        try:
-            cur = con.cursor()
-
-            # stratégie : on tente d’insérer, si contrainte unique -> déjà vu
-            try:
-                cur.execute("""
-                    INSERT INTO news_reads (fetched_at, source_url, entity_id, site, title, url, canonical_url, published_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (fetched_at, source_url, entity_id, site, title, url, canonical_url, published_at))
-                con.commit()
-                return True
-            except sqlite3.IntegrityError:
-                return False
-        finally:
-            con.close()
+__all__ = ["RateLimiter", "RobotsChecker", "RawEventsDB", "Watcher", "WatcherService"]
