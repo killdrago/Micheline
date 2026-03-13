@@ -1029,3 +1029,6 @@ WATCHER_HTTP_TIMEOUT = 15
 
 # Batch size pour le traitement des événements non traités
 WATCHER_PROCESS_BATCH_SIZE = 100
+
+WATCHER_RETENTION_DAYS = 7
+WATCHER_PURGE_EVERY_SEC = 3600
