@@ -24,8 +24,9 @@ import tempfile  # Optionnel (patch tmp)
 from micheline import self_awareness_tool
 from micheline.intel.watchers import WatcherService
 import queue
-import datetime
+import datetime as dt
 import webbrowser
+import hashlib
 
 # Coller/aperçus d'images (Pillow)
 try:
@@ -1151,7 +1152,7 @@ class App:
         self.root = root
         self.news_queue = queue.Queue()
         self.news_max_rows = 500
-        self._start_watcher_service()
+        self._start_watchers_after_ssl_preflight()
         self.watcher_service = None
         self._watcher_thread = None
         self.root.title("Micheline - Tableau de Bord IA")
@@ -1160,6 +1161,7 @@ class App:
         cfg = config.load_config_data()
         geom = cfg.get("ui_resolution", "1280x960")  # défaut si non défini
         self.root.geometry(geom)
+        self._init_news_translation_cache()
 
         # Garde taille pendant déplacement (supprime les à-coups de resize)
         try:
@@ -1232,7 +1234,7 @@ class App:
         self._attached_images = []  # liste de dicts {"path": ..., "photo": PhotoImage|None}
 
         # Peuplement des onglets + timers
-        self.populate_all_tabs()
+        self.root.after(50, self.populate_all_tabs)   # UI en plusieurs étapes (voir fonction ci-dessous)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.after(100, self.process_log_queue)
         self.root.after(500, self.initial_setup)
@@ -1374,19 +1376,57 @@ class App:
             print(f"[MT5 Check] ERREUR critique lors du lancement de MT5 : {e}")
     
     def populate_all_tabs(self):
-        self.populate_interaction_tab()
-        self.populate_pairs_tab()
-        self.populate_features_tab()
-        self.populate_logs_tab()
-        self.populate_config_tab()
-        self.populate_status_tab()
+        steps = [
+            ("Interaction", self.populate_interaction_tab),
+            ("Paires", self.populate_pairs_tab),
+            ("Logs", self.populate_logs_tab),
+            ("Config", self.populate_config_tab),
+            ("Etat IA", self.populate_status_tab),
+            ("Features", self.populate_features_tab),  # souvent le plus lourd -> à la fin
+        ]
+
+        def run_step(i=0):
+            if i >= len(steps):
+                try:
+                    print("[UI] Onglets chargés.")
+                except Exception:
+                    pass
+                return
+
+            name, fn = steps[i]
+            try:
+                # petit log optionnel
+                # print(f"[UI] Chargement onglet: {name}...")
+                fn()
+            except Exception as e:
+                try:
+                    print(f"[UI] Erreur chargement onglet {name}: {e}")
+                except Exception:
+                    pass
+
+            # Laisse Tk respirer avant de faire l’étape suivante
+            self.root.after(1, lambda: run_step(i + 1))
+
+        run_step(0)
         
     def initial_setup(self):
-        # Démarrage worker + orchestrateur
-        self.start_worker_process()
-        self.start_orchestrator()
-        # Vérifie si MT5 est ouvert, sinon le lance
-        self._ensure_mt5_is_running()
+        # Démarrage worker + orchestrateur (UI thread OK)
+        try:
+            self.start_worker_process()
+        except Exception as e:
+            print(f"[INIT] start_worker_process error: {e}")
+
+        try:
+            self.start_orchestrator()
+        except Exception as e:
+            print(f"[INIT] start_orchestrator error: {e}")
+
+        # MT5: en thread pour ne pas geler l'UI
+        try:
+            import threading
+            threading.Thread(target=self._ensure_mt5_is_running, daemon=True).start()
+        except Exception as e:
+            print(f"[INIT] MT5 thread error: {e}")
 
     def check_worker_status(self):
         try:
@@ -2801,21 +2841,121 @@ class App:
         except Exception:
             pass
 
-    def news_log_read(self, site: str, title: str, url: str):
+    def news_log_read(self, site: str, title: str, url: str, ev: dict = None):
         """
-        À appeler depuis N'IMPORTE QUEL thread.
-        Ne touche pas Tkinter directement: push dans la queue.
+        Callback du watcher.
+        - Si ev['fetched_at'] existe -> on l'utilise (replay + nouveaux items)
+        - Sinon -> on met l'heure actuelle
         """
+        # 1) timestamp (priorité: event.fetched_at)
+        ts = None
         try:
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if isinstance(ev, dict):
+                ts = (ev.get("fetched_at") or ev.get("read_at") or "").strip() or None
+        except Exception:
+            ts = None
+
+        if not ts:
+            try:
+                import datetime as dt
+                ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts = ""
+
+        # 2) traduction du titre selon langue UI (si tu as implémenté ça)
+        try:
+            lang = self._get_ui_lang_code()
+            title_display = self._translate_news_title(title, lang)
+        except Exception:
+            title_display = title
+
+        # 3) push dans la queue du tab News
+        try:
             self.news_queue.put({
                 "read_at": ts,
                 "site": (site or "").strip(),
-                "title": (title or "").strip(),
+                "title": (title_display or "").strip(),
                 "url": (url or "").strip(),
             })
         except Exception:
             pass
+            
+    def _start_watchers_after_ssl_preflight(self):
+        import threading
+        t = threading.Thread(target=self._ssl_preflight_then_start_watchers, daemon=True)
+        t.start()
+
+    def _ssl_preflight_then_start_watchers(self):
+        ok = self._ensure_https_ok_once()
+        if not ok:
+            print("[SSL] Toujours KO après tentative de correction. Le watcher risque d'échouer sur certains sites HTTPS.")
+        # Démarre le watcher seulement après la pré-vérif SSL
+        try:
+            self.root.after(0, self._start_watcher_service)
+        except Exception:
+            # fallback
+            self._start_watcher_service()
+
+    def _ensure_https_ok_once(self) -> bool:
+        """
+        Vérifie 1 seule fois (flag sur disque).
+        Si SSL cassé, tente: pip install -U certifi requests (en arrière-plan dans CE thread).
+        """
+        import os, json, time, subprocess
+        import requests
+        import certifi
+
+        flag_path = os.path.join("micheline", "cache", "ssl_preflight.json")
+        os.makedirs(os.path.dirname(flag_path), exist_ok=True)
+
+        # Si déjà vérifié récemment, on ne refait pas
+        try:
+            if os.path.exists(flag_path):
+                data = json.load(open(flag_path, "r", encoding="utf-8"))
+                ts = float(data.get("ts", 0))
+                if (time.time() - ts) < 7 * 24 * 3600:  # 7 jours
+                    return bool(data.get("ok", True))
+        except Exception:
+            pass
+
+        def test_https() -> bool:
+            test_urls = [
+                "https://www.google.com/generate_204",
+                "https://raw.githubusercontent.com/",
+                "https://www.ecb.europa.eu/"
+            ]
+            for u in test_urls:
+                try:
+                    r = requests.get(u, timeout=10, verify=certifi.where())
+                    if r.status_code < 500:
+                        return True
+                except requests.exceptions.SSLError as e:
+                    print("[SSL] SSLError:", e)
+                    return False
+                except Exception:
+                    # réseau down, proxy, etc -> on ne conclut pas "SSL cassé"
+                    continue
+            return True
+
+        ok = test_https()
+        if not ok:
+            print("[SSL] Tentative de correction: upgrade certifi + requests ...")
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--upgrade", "certifi", "requests"],
+                    capture_output=True, text=True
+                )
+            except Exception as e:
+                print("[SSL] pip upgrade a échoué:", e)
+
+            ok = test_https()
+
+        try:
+            json.dump({"ts": time.time(), "ok": ok}, open(flag_path, "w", encoding="utf-8"))
+        except Exception:
+            pass
+
+        return ok
 
     def populate_news_tab(self):
         # Tableau des lectures
@@ -5129,10 +5269,136 @@ class App:
                     w.configure(state=("disabled" if auto_on else "normal"))
                 except Exception:
                     pass
-                
+              
+    def _get_ui_lang_code(self) -> str:
+        """
+        Retourne un code langue (fr/en/de/it/es...) basé sur la langue choisie en haut.
+        Essaie plusieurs noms de variables pour être compatible avec ton code.
+        """
+        # Map libellés -> code
+        label_to_code = {
+            "français": "fr", "french": "fr", "fr": "fr",
+            "english": "en", "anglais": "en", "en": "en",
+            "deutsch": "de", "allemand": "de", "de": "de",
+            "italiano": "it", "italien": "it", "it": "it",
+            "español": "es", "espagnol": "es", "es": "es",
+        }
+
+        # 1) essaie de lire une variable Tkinter existante (adapte si besoin)
+        for attr in ("lang_var", "language_var", "ui_lang_var", "selected_language_var"):
+            v = getattr(self, attr, None)
+            if v is None:
+                continue
+            try:
+                raw = v.get()
+            except Exception:
+                raw = str(v)
+
+            raw = (raw or "").strip().lower()
+            if raw in label_to_code:
+                return label_to_code[raw]
+            if len(raw) >= 2 and raw[:2] in ("fr", "en", "de", "it", "es"):
+                return raw[:2]
+
+        # 2) fallback config (si tu stockes la langue là)
+        try:
+            cfg = config.load_config_data()
+            raw = (cfg.get("ui_language") or cfg.get("language") or "fr").strip().lower()
+            return label_to_code.get(raw, raw[:2] if len(raw) >= 2 else "fr")
+        except Exception:
+            return "fr"
+
+
+    def _init_news_translation_cache(self):
+        """
+        A appeler 1 fois dans __init__.
+        Stocke les traductions sur disque pour éviter de retraduire à chaque redémarrage.
+        """
+        import os, json, threading
+        self._news_tr_cache_lock = threading.Lock()
+        self._news_tr_cache_path = os.path.join("micheline", "cache", "news_title_translations.json")
+        os.makedirs(os.path.dirname(self._news_tr_cache_path), exist_ok=True)
+
+        self._news_tr_cache = {}
+        try:
+            if os.path.exists(self._news_tr_cache_path):
+                with open(self._news_tr_cache_path, "r", encoding="utf-8") as f:
+                    self._news_tr_cache = json.load(f) or {}
+        except Exception:
+            self._news_tr_cache = {}
+
+        self._news_tr_cache_dirty = 0
+
+
+    def _save_news_translation_cache(self):
+        import json
+        try:
+            with self._news_tr_cache_lock:
+                if self._news_tr_cache_dirty <= 0:
+                    return
+                with open(self._news_tr_cache_path, "w", encoding="utf-8") as f:
+                    json.dump(self._news_tr_cache, f, ensure_ascii=False, indent=2)
+                self._news_tr_cache_dirty = 0
+        except Exception:
+            pass
+
+
+    def _translate_news_title(self, title: str, target_lang: str) -> str:
+        """
+        Traduit un titre dans la langue target_lang (fr/en/de/it/es).
+        - Cache disque + RAM
+        - Fallback = titre original si erreur ou lib non installée
+        """
+        title = (title or "").strip()
+        if not title:
+            return title
+
+        target_lang = (target_lang or "fr").strip().lower()
+        if target_lang not in ("fr", "en", "de", "it", "es"):
+            return title
+
+        # clé cache (lang + hash du titre)
+        key = f"{target_lang}::{hashlib.sha1(title.encode('utf-8', errors='ignore')).hexdigest()}"
+
+        try:
+            with self._news_tr_cache_lock:
+                cached = self._news_tr_cache.get(key)
+            if cached:
+                return cached
+        except Exception:
+            pass
+
+        # Si deep-translator n'est pas installé => fallback
+        try:
+            from deep_translator import GoogleTranslator
+        except Exception:
+            return title
+
+        try:
+            translated = GoogleTranslator(source="auto", target=target_lang).translate(text=title)  # <!--citation:1-->
+            translated = (translated or "").strip() or title
+        except Exception:
+            translated = title
+
+        # store cache
+        try:
+            with self._news_tr_cache_lock:
+                self._news_tr_cache[key] = translated
+                self._news_tr_cache_dirty += 1
+                # Sauvegarde périodique (tous les 20 nouveaux titres)
+                if self._news_tr_cache_dirty >= 20:
+                    # petite sauvegarde sans bloquer trop
+                    pass
+            if self._news_tr_cache_dirty >= 20:
+                self._save_news_translation_cache()
+        except Exception:
+            pass
+
+        return translated
+              
     def _start_watcher_service(self):
         self.watcher_service = None
-        self._watcher_thread = None
+        self._watcher_thread = None  # (pas utilisé si WatcherService gère son propre thread)
 
         try:
             from micheline.intel.watchers import WatcherService
@@ -5141,7 +5407,7 @@ class App:
             print("[WATCHERS] Import impossible:", e)
             return False
 
-        # Seed auto si registry vide
+        # 1) Seed auto si registry vide
         try:
             registry = EntityRegistry()
             if not registry.list_all_active_sources():
@@ -5151,12 +5417,19 @@ class App:
         except Exception as e:
             print("[WATCHERS] Seed registry a échoué:", e)
 
-        # Start watcher
+        # 2) Start watcher (avec callback vers l'onglet News si possible)
         try:
-            self.watcher_service = WatcherService()
-            self.watcher_service.start()  # start thread (daemon par défaut)
+            # IMPORTANT: on_item=self.news_log_read => le watcher push ce qu'il lit vers ton onglet "News"
+            try:
+                self.watcher_service = WatcherService(on_item=self.news_log_read)
+            except TypeError:
+                # Si ta version de WatcherService n'accepte pas on_item, on retombe sur l'init simple
+                self.watcher_service = WatcherService()
+
+            self.watcher_service.start()  # thread daemon géré par le watcher
             print("[WATCHERS] Démarré via .start()")
             return True
+
         except Exception as e:
             print("[WATCHERS] start() a échoué:", e)
             self.watcher_service = None
@@ -5297,58 +5570,109 @@ class App:
         - Force le garbage collector
         """
         import gc
+        import time
 
         # 1) Purge bulles
-        self._trim_chat_rows()
         try:
-            self._band_rows = [r for r in self._band_rows if r and r.winfo_exists()]
+            self._trim_chat_rows()
+        except Exception as e:
+            print(f"[CLEANUP] _trim_chat_rows error: {e}")
+
+        try:
+            self._band_rows = [r for r in getattr(self, "_band_rows", []) if r and r.winfo_exists()]
         except Exception:
             pass
 
         # 2) Auto-unload LLM si inactif (JAMAIS pendant une génération active)
-        is_generating = getattr(self, "_is_generating", False)
+        is_generating = bool(getattr(self, "_is_generating", False))
 
         if not is_generating:
-            unload_sec = int(getattr(config, "LLM_AUTO_UNLOAD_SEC", 300))
-            if unload_sec > 0 and self.llm and hasattr(self.llm, "is_loaded") and self.llm.is_loaded():
-                idle = self.llm.idle_seconds()
-                if idle >= unload_sec:
+            try:
+                unload_sec = int(getattr(config, "LLM_AUTO_UNLOAD_SEC", 300))
+            except Exception:
+                unload_sec = 300
+
+            try:
+                llm = getattr(self, "llm", None)
+                if unload_sec > 0 and llm and hasattr(llm, "is_loaded") and llm.is_loaded():
+                    idle = 0
                     try:
-                        self.llm.unload()
-                    except Exception as e:
+                        idle = llm.idle_seconds()
+                    except Exception:
+                        idle = 0
+
+                    if idle >= unload_sec:
+                        try:
+                            llm.unload()
+                            print(f"[LLM] Auto-unload après {idle:.0f}s d'inactivité (seuil={unload_sec}s)")
+                        except Exception as e:
+                            print(f"[LLM] Erreur unload: {e}")
+            except Exception as e:
+                print(f"[LLM] Erreur auto-unload: {e}")
 
         # 3) Vérification RAM (déchargement d'urgence seulement si PAS en génération)
         try:
             from micheline.local_llm import get_ram_info
+
             ram = get_ram_info()
             limit = float(getattr(config, "RAM_LIMIT_PERCENT", 75))
             warn = float(getattr(config, "RAM_WARN_PERCENT", 65))
 
-            if ram["total_mb"] > 0:
-                if ram["used_percent"] >= limit and not is_generating:
-                    if self.llm and hasattr(self.llm, "is_loaded") and self.llm.is_loaded():
-                        print(f"[RAM] Déchargement d'urgence du LLM")
-                        self.llm.unload()
-                elif ram["used_percent"] >= limit and is_generating:
-                elif ram["used_percent"] >= warn:
+            used = float(ram.get("used_percent", 0.0))
+            total_mb = float(ram.get("total_mb", 0.0))
+
+            if total_mb > 0:
+                llm = getattr(self, "llm", None)
+
+                if used >= limit and not is_generating:
+                    if llm and hasattr(llm, "is_loaded") and llm.is_loaded():
+                        print(f"[RAM] {used:.1f}% >= {limit:.1f}% -> Déchargement d'urgence du LLM")
+                        try:
+                            llm.unload()
+                        except Exception as e:
+                            print(f"[RAM] Erreur unload d'urgence: {e}")
+
+                elif used >= limit and is_generating:
+                    # IMPORTANT: on ne décharge pas pendant la génération
+                    print(f"[RAM] ALERTE: {used:.1f}% >= {limit:.1f}% mais génération en cours -> pas de unload")
+
+                elif used >= warn:
+                    print(f"[RAM] Warning: {used:.1f}% >= {warn:.1f}%")
+
         except ImportError:
             pass
         except Exception as e:
             print(f"[RAM] Erreur monitoring: {e}")
 
         # 4) Garbage collector
-        gc.collect()
-
-        # 5) Log périodique
         try:
-            from micheline.local_llm import get_ram_info
-            ram = get_ram_info()
-            llm_status = "chargé" if (self.llm and hasattr(self.llm, "is_loaded") and self.llm.is_loaded()) else "déchargé"
-            gen_status = " | GÉNÉRATION EN COURS" if is_generating else ""
+            gc.collect()
         except Exception:
+            pass
 
-        # Replanifie
-        self.root.after(30000, self._periodic_cleanup)
+        # 5) Log périodique (toutes les ~2 minutes par ex)
+        try:
+            now = time.time()
+            last = float(getattr(self, "_last_periodic_log_ts", 0.0))
+            if now - last >= 120:
+                from micheline.local_llm import get_ram_info
+                ram = get_ram_info()
+
+                llm = getattr(self, "llm", None)
+                llm_loaded = bool(llm and hasattr(llm, "is_loaded") and llm.is_loaded())
+                llm_status = "chargé" if llm_loaded else "déchargé"
+                gen_status = " | GÉNÉRATION EN COURS" if is_generating else ""
+
+                self._last_periodic_log_ts = now
+        except Exception:
+            pass
+
+        # Replanifie (si la fenêtre existe encore)
+        try:
+            if getattr(self, "root", None):
+                self.root.after(30000, self._periodic_cleanup)
+        except Exception:
+            pass
         
     def _on_clipboard_paste(self, event=None):
         # Tente de récupérer une image depuis le presse-papiers (Pillow requis)
