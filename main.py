@@ -1150,8 +1150,10 @@ class WindowMoveSizeGuard:
 class App:
     def __init__(self, root):
         self.root = root
+        self._pending_log_lines = []
         self.news_queue = queue.Queue()
-        self.news_max_rows = 500
+        self.news_category_prefs = self._load_news_category_prefs()
+        self.news_max_rows = 1000
         self._start_watchers_after_ssl_preflight()
         self.watcher_service = None
         self._watcher_thread = None
@@ -1648,16 +1650,51 @@ class App:
         out.close()
 
     def write_to_console_safe(self, text):
-        self.logs_console.config(state=tk.NORMAL)
-        self.logs_console.insert(tk.END, text)
-        self.logs_console.config(state=tk.DISABLED)
-        self.logs_console.see(tk.END)
+        # Si la console n'existe pas encore (startup async), on met en buffer
+        if not hasattr(self, "logs_console") or self.logs_console is None:
+            try:
+                self._pending_log_lines.append(text)
+                # évite que ça gonfle à l'infini si jamais l'onglet logs n'est jamais créé
+                if len(self._pending_log_lines) > 5000:
+                    self._pending_log_lines = self._pending_log_lines[-2000:]
+            except Exception:
+                pass
+            return
 
-    def process_log_queue(self):
+        # Si le widget a été détruit (fermeture)
         try:
-            while True: self.write_to_console_safe(self.log_queue.get_nowait())
-        except Empty: pass
-        finally: self.root.after(100, self.process_log_queue)
+            if not self.logs_console.winfo_exists():
+                return
+        except Exception:
+            return
+
+        try:
+            self.logs_console.config(state=tk.NORMAL)
+            self.logs_console.insert(tk.END, str(text) + "\n")
+            self.logs_console.see(tk.END)
+            self.logs_console.config(state=tk.DISABLED)
+        except Exception:
+            pass
+        
+    def process_log_queue(self):
+        # Si logs_console pas prêt, on réessaie plus tard (et surtout on ne crashe pas)
+        if not hasattr(self, "logs_console") or self.logs_console is None:
+            try:
+                self.root.after(250, self.process_log_queue)
+            except Exception:
+                pass
+            return
+
+        try:
+            while True:
+                self.write_to_console_safe(self.log_queue.get_nowait())
+        except Exception:
+            pass
+
+        try:
+            self.root.after(100, self.process_log_queue)
+        except Exception:
+            pass
 
     def add_task_to_queue(self, task_script, task_params, priority=False, timeout_sec=None, cwd=None):
         try:
@@ -2485,13 +2522,12 @@ class App:
         )
         self.logs_console.pack(fill=tk.BOTH, expand=True)
 
-        # Important: donner le focus au Text quand on clique dedans (sinon Ctrl+C ne part pas)
+        # Donne le focus au Text quand on clique dedans (sinon Ctrl+C peut ne pas partir)
         def _focus_text(event=None):
             try:
                 self.logs_console.focus_set()
             except Exception:
                 pass
-            # ne pas "break" -> on laisse Tk gérer la sélection normale à la souris
             return None
 
         self.logs_console.bind("<Button-1>", _focus_text)
@@ -2508,7 +2544,6 @@ class App:
                 text = self.logs_console.get("sel.first", "sel.last")
             except tk.TclError:
                 text = ""
-
             if text:
                 try:
                     self.root.clipboard_clear()
@@ -2527,7 +2562,6 @@ class App:
                 pass
             return "break"
 
-        # Menu contextuel clic droit
         menu = tk.Menu(self.logs_console, tearoff=0)
         menu.add_command(label="Copier", command=copy_selection)
         menu.add_command(label="Tout sélectionner", command=select_all)
@@ -2543,23 +2577,36 @@ class App:
                     pass
             return "break"
 
-        # Bind du menu contextuel (Windows/Linux = Button-3, mac parfois Button-2)
         self.logs_console.bind("<Button-3>", show_context_menu)
         self.logs_console.bind("<Button-2>", show_context_menu)
 
-        # Bind clavier (Windows/Linux Ctrl+C, macOS Cmd+C)
         self.logs_console.bind("<Control-c>", copy_selection)
         self.logs_console.bind("<Control-C>", copy_selection)
         self.logs_console.bind("<Control-Insert>", copy_selection)
         self.logs_console.bind("<Command-c>", copy_selection)
         self.logs_console.bind("<Command-C>", copy_selection)
 
-        # Bonus: Ctrl+A / Cmd+A pour tout sélectionner
         self.logs_console.bind("<Control-a>", select_all)
         self.logs_console.bind("<Control-A>", select_all)
         self.logs_console.bind("<Command-a>", select_all)
         self.logs_console.bind("<Command-A>", select_all)
-    
+
+        # Flush des logs accumulés avant la création du widget
+        try:
+            pending = getattr(self, "_pending_log_lines", [])
+            if pending:
+                for line in pending:
+                    self.write_to_console_safe(line)
+                self._pending_log_lines = []
+        except Exception:
+            pass
+
+        # Assure que la boucle de traitement est lancée (si tu ne l'as pas déjà ailleurs)
+        try:
+            self.root.after(100, self.process_log_queue)
+        except Exception:
+            pass
+        
     def copy_selected_logs(self, event=None):
         try: text = self.logs_console.get("sel.first", "sel.last")
         except tk.TclError: text = ""
@@ -2789,45 +2836,217 @@ class App:
             print(f"[STATUS] refresh on select error: {e}")
 
     def _open_selected_news_url(self, event=None):
+        import webbrowser
         try:
-            sel = self.news_tree.selection()
+            tree = event.widget if event is not None else None
+            if tree is None:
+                return
+            sel = tree.selection()
             if not sel:
                 return
-            values = self.news_tree.item(sel[0], "values")
-            if not values or len(values) < 4:
+            values = tree.item(sel[0], "values")
+            if not values or len(values) < 7:
                 return
-            url = values[3]
+            url = values[6]
             if url:
                 webbrowser.open(url)
         except Exception:
             pass
 
-    def _pump_news_queue(self):
+    def _on_news_tree_click(self, event):
+        tree = event.widget
         try:
-            # Vide la queue (tout ce qui est arrivé depuis le dernier tick)
+            region = tree.identify("region", event.x, event.y)
+            if region != "cell":
+                return
+
+            row_id = tree.identify_row(event.y)
+            col = tree.identify_column(event.x)  # "#1" keep, "#2" drop
+            if not row_id:
+                return
+
+            vals = tree.item(row_id, "values") or ()
+            if len(vals) < 7:
+                return
+
+            event_type = (vals[3] or "unknown").strip() or "unknown"
+
+            # keep (✓)
+            if col == "#1":
+                cur = self._get_category_pref(event_type)
+                new = 0 if cur == 1 else 1   # toggle keep <-> neutre
+                self._set_category_pref(event_type, new)
+                return "break"
+
+            # drop (✗)
+            if col == "#2":
+                cur = self._get_category_pref(event_type)
+                new = 0 if cur == -1 else -1  # toggle drop <-> neutre
+                self._set_category_pref(event_type, new)
+                return "break"
+
+        except Exception:
+            pass
+
+        return None
+    
+    def _action_cells(self, pref: int) -> tuple[str, str]:
+        """
+        pref:
+          1  => keep (☑)
+         -1  => drop (☒)
+          0  => neutre (☐)
+        """
+        if pref == 1:
+            return ("☑", "☐")
+        if pref == -1:
+            return ("☐", "☒")
+        return ("☐", "☐")
+
+
+    def _insert_news_row(self, tree, read_at: str, event_type: str, site: str, title: str, url: str, pref: int):
+        keep_cell, drop_cell = self._action_cells(pref)
+        try:
+            tree.insert("", 0, values=(keep_cell, drop_cell, read_at, event_type, site, title, url))
+        except Exception:
+            return
+
+        try:
+            max_rows = int(getattr(self, "news_max_rows", 1000))
+            children = tree.get_children("")
+            if len(children) > max_rows:
+                for iid in children[max_rows:]:
+                    tree.delete(iid)
+        except Exception:
+            pass
+
+    def _refresh_action_cells_for_category(self, event_type: str):
+        pref = self._get_category_pref(event_type)
+        keep_cell, drop_cell = self._action_cells(pref)
+
+        def refresh(tree):
+            try:
+                for iid in tree.get_children(""):
+                    vals = list(tree.item(iid, "values") or [])
+                    if len(vals) < 7:
+                        continue
+                    if (vals[3] or "") == event_type:
+                        vals[0] = keep_cell
+                        vals[1] = drop_cell
+                        tree.item(iid, values=vals)
+            except Exception:
+                pass
+
+        refresh(self.news_tree_retained)
+        refresh(self.news_tree_blocked)
+
+
+    def _move_rows_by_category(self, event_type: str):
+        pref = self._get_category_pref(event_type)
+        target = self.news_tree_blocked if pref == -1 else self.news_tree_retained
+        other = self.news_tree_retained if pref == -1 else self.news_tree_blocked
+
+        to_move = []
+        try:
+            for iid in other.get_children(""):
+                vals = other.item(iid, "values") or ()
+                if len(vals) >= 7 and (vals[3] or "") == event_type:
+                    to_move.append((iid, vals))
+        except Exception:
+            to_move = []
+
+        for iid, vals in to_move:
+            try:
+                other.delete(iid)
+            except Exception:
+                pass
+
+            try:
+                keep_cell, drop_cell = self._action_cells(pref)
+                vals = list(vals)
+                vals[0] = keep_cell
+                vals[1] = drop_cell
+                target.insert("", 0, values=vals)
+            except Exception:
+                pass
+
+    def _news_prefs_path(self) -> str:
+        import os
+        os.makedirs(os.path.join("micheline", "configs"), exist_ok=True)
+        return os.path.join("micheline", "configs", "news_category_prefs.json")
+
+
+    def _load_news_category_prefs(self) -> dict:
+        import json, os
+        path = self._news_prefs_path()
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+
+    def _save_news_category_prefs(self):
+        import json
+        try:
+            with open(self._news_prefs_path(), "w", encoding="utf-8") as f:
+                json.dump(self.news_category_prefs, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+    def _get_category_pref(self, event_type: str) -> int:
+        event_type = (event_type or "unknown").strip() or "unknown"
+        try:
+            v = int(self.news_category_prefs.get(event_type, 0))
+            return v if v in (-1, 0, 1) else 0
+        except Exception:
+            return 0
+
+
+    def _set_category_pref(self, event_type: str, pref: int):
+        event_type = (event_type or "unknown").strip() or "unknown"
+        try:
+            pref = int(pref)
+            if pref not in (-1, 0, 1):
+                pref = 0
+        except Exception:
+            pref = 0
+
+        self.news_category_prefs[event_type] = pref
+        self._save_news_category_prefs()
+
+        # Déplace toutes les lignes de cette catégorie
+        self._move_rows_by_category(event_type)
+        self._refresh_action_cells_for_category(event_type)
+
+    def _pump_news_queue(self):
+        import queue as _q
+
+        try:
             while True:
                 item = self.news_queue.get_nowait()
 
-                # Insert en haut
-                try:
-                    self.news_tree.insert(
-                        "", 0,
-                        values=(item["read_at"], item["site"], item["title"], item["url"])
-                    )
-                except Exception:
-                    pass
+                event_type = (item.get("event_type") or "unknown").strip() or "unknown"
+                pref = self._get_category_pref(event_type)  # -1 blocked, 0 neutral, 1 keep
 
-                # Limiter le nombre de lignes
-                try:
-                    children = self.news_tree.get_children("")
-                    if len(children) > self.news_max_rows:
-                        # supprime en bas
-                        for iid in children[self.news_max_rows:]:
-                            self.news_tree.delete(iid)
-                except Exception:
-                    pass
+                tree = self.news_tree_blocked if pref == -1 else self.news_tree_retained
 
-        except queue.Empty:
+                self._insert_news_row(
+                    tree=tree,
+                    read_at=item.get("read_at", ""),
+                    event_type=event_type,
+                    site=item.get("site", ""),
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    pref=pref
+                )
+
+        except _q.Empty:
             pass
         except Exception as e:
             try:
@@ -2835,19 +3054,13 @@ class App:
             except Exception:
                 pass
 
-        # Re-planifie
         try:
-            self.root.after(500, self._pump_news_queue)  # 0.5s
+            self.root.after(500, self._pump_news_queue)
         except Exception:
             pass
-
+        
     def news_log_read(self, site: str, title: str, url: str, ev: dict = None):
-        """
-        Callback du watcher.
-        - Si ev['fetched_at'] existe -> on l'utilise (replay + nouveaux items)
-        - Sinon -> on met l'heure actuelle
-        """
-        # 1) timestamp (priorité: event.fetched_at)
+        # Timestamp: conserve fetched_at si fourni
         ts = None
         try:
             if isinstance(ev, dict):
@@ -2862,24 +3075,32 @@ class App:
             except Exception:
                 ts = ""
 
-        # 2) traduction du titre selon langue UI (si tu as implémenté ça)
+        # Famille/catégorie
+        event_type = "unknown"
+        try:
+            if isinstance(ev, dict):
+                event_type = (ev.get("event_type") or "unknown").strip() or "unknown"
+        except Exception:
+            event_type = "unknown"
+
+        # Traduction si dispo
         try:
             lang = self._get_ui_lang_code()
             title_display = self._translate_news_title(title, lang)
         except Exception:
             title_display = title
 
-        # 3) push dans la queue du tab News
         try:
             self.news_queue.put({
                 "read_at": ts,
+                "event_type": event_type,
                 "site": (site or "").strip(),
                 "title": (title_display or "").strip(),
                 "url": (url or "").strip(),
             })
         except Exception:
             pass
-            
+        
     def _start_watchers_after_ssl_preflight(self):
         import threading
         t = threading.Thread(target=self._ssl_preflight_then_start_watchers, daemon=True)
@@ -2958,32 +3179,56 @@ class App:
         return ok
 
     def populate_news_tab(self):
-        # Tableau des lectures
-        columns = ("read_at", "site", "title", "url")
+        for w in self.news_tab.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
 
-        self.news_tree = ttk.Treeview(self.news_tab, columns=columns, show="headings")
-        self.news_tree.heading("read_at", text="Lu le")
-        self.news_tree.heading("site", text="Site")
-        self.news_tree.heading("title", text="Article")
-        self.news_tree.heading("url", text="URL")
+        self.news_notebook = ttk.Notebook(self.news_tab)
+        self.news_notebook.pack(fill="both", expand=True)
 
-        self.news_tree.column("read_at", width=150, anchor="w")
-        self.news_tree.column("site", width=160, anchor="w")
-        self.news_tree.column("title", width=520, anchor="w")
-        self.news_tree.column("url", width=520, anchor="w")
+        self.news_tab_retained = ttk.Frame(self.news_notebook)
+        self.news_tab_blocked = ttk.Frame(self.news_notebook)
 
-        yscroll = ttk.Scrollbar(self.news_tab, orient="vertical", command=self.news_tree.yview)
-        self.news_tree.configure(yscrollcommand=yscroll.set)
+        self.news_notebook.add(self.news_tab_retained, text="Retenu")
+        self.news_notebook.add(self.news_tab_blocked, text="Non retenu")
 
-        self.news_tree.pack(side="left", fill="both", expand=True)
-        yscroll.pack(side="right", fill="y")
+        columns = ("keep", "drop", "read_at", "event_type", "site", "title", "url")
 
-        # Double-clic = ouvrir l’URL
-        self.news_tree.bind("<Double-1>", self._open_selected_news_url)
+        def make_tree(parent):
+            tree = ttk.Treeview(parent, columns=columns, show="headings")
+            tree.heading("keep", text="✓")
+            tree.heading("drop", text="✗")
+            tree.heading("read_at", text="Lu le")
+            tree.heading("event_type", text="Famille")
+            tree.heading("site", text="Site")
+            tree.heading("title", text="Article")
+            tree.heading("url", text="URL")
 
-        # Démarre la pompe qui vide la queue et met à jour le tableau
+            tree.column("keep", width=35, anchor="center", stretch=False)
+            tree.column("drop", width=35, anchor="center", stretch=False)
+            tree.column("read_at", width=155, anchor="w", stretch=False)
+            tree.column("event_type", width=170, anchor="w", stretch=False)
+            tree.column("site", width=170, anchor="w", stretch=False)
+            tree.column("title", width=520, anchor="w", stretch=True)
+            tree.column("url", width=520, anchor="w", stretch=True)
+
+            yscroll = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+            tree.configure(yscrollcommand=yscroll.set)
+
+            tree.pack(side="left", fill="both", expand=True)
+            yscroll.pack(side="right", fill="y")
+
+            tree.bind("<Button-1>", self._on_news_tree_click, add="+")
+            tree.bind("<Double-1>", self._open_selected_news_url, add="+")
+            return tree
+
+        self.news_tree_retained = make_tree(self.news_tab_retained)
+        self.news_tree_blocked = make_tree(self.news_tab_blocked)
+
         self._pump_news_queue()
-
+    
     def save_general_config(self):
         try:
             cfg = config.load_config_data()
@@ -5416,6 +5661,11 @@ class App:
                 print("[WATCHERS] ✅ Registry initialisé.")
         except Exception as e:
             print("[WATCHERS] Seed registry a échoué:", e)
+        try:
+            from micheline.intel.entity_registry import seed_news_portfolio_sources
+            seed_news_portfolio_sources()
+        except Exception as e:
+            print("[WATCHERS] Seed news portfolio a échoué:", e)
 
         # 2) Start watcher (avec callback vers l'onglet News si possible)
         try:
