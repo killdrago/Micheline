@@ -1,12 +1,11 @@
 # micheline/intel/watchers.py
-# Service de surveillance continue des sources (RSS/web/social/official_doc)
-# - Poll périodique basé sur le registry (EntityRegistry SQLite)
-# - Respect robots.txt (tolérant en cas d'erreur)
+# Watcher service + RawEventsDB + Bloc 3 (Event Cards)
+# - Poll périodique basé sur EntityRegistry (SQLite)
+# - Respect robots.txt (tolérant)
 # - Rate limiting par domaine
-# - Extraction + stockage en "raw events" (SQLite)
-# - Callback optionnel (on_item) pour pousser les lectures vers l'UI (onglet News)
-# - Rétention (ex: 7 jours) + purge automatique
-# - Replay au démarrage avec timestamp ORIGINAL (fetched_at) => l'heure affichée reste correcte après redémarrage
+# - Stockage raw events (raw_events.sqlite) + rétention + replay UI
+# - Bloc 3: normalisation en Event Cards (event_cards.sqlite)
+# - IMPORTANT: event_type est calculé, stocké dans raw_events, et rejoué à l'UI
 
 from __future__ import annotations
 
@@ -14,6 +13,7 @@ import os
 import time
 import json
 import uuid
+import re
 import hashlib
 import sqlite3
 import threading
@@ -48,7 +48,9 @@ from micheline.intel.entity_registry import EntityRegistry
 # Constantes / chemins
 # ==========================
 
-EVENTS_DB_PATH = os.path.join(os.path.dirname(__file__), "db", "raw_events.sqlite")
+BASE_DIR = os.path.dirname(__file__)
+EVENTS_DB_PATH = os.path.join(BASE_DIR, "db", "raw_events.sqlite")
+EVENT_CARDS_DB_PATH = os.path.join(BASE_DIR, "db", "event_cards.sqlite")
 
 DEFAULT_UA = getattr(
     config,
@@ -81,6 +83,12 @@ def _safe_json(obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False)
     except Exception:
         return "{}"
+
+def _strip_html(text: str) -> str:
+    text = text or ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 def _requests_verify_value() -> Any:
     """
@@ -116,13 +124,11 @@ def _rewrite_source_if_needed(source_type: str, url: str) -> (str, str, str):
     u = (url or "").strip()
     ul = u.lower()
 
-    # Trump: TruthSocial / RSSHub -> trumpstruth RSS (public)
     if "truthsocial.com/@realdonaldtrump" in ul:
         return ("rss", TRUMP_TRUTH_RSS, "TruthSocial bloqué robots -> trumpstruth RSS")
     if "rsshub.app/truthsocial/realdonaldtrump" in ul:
         return ("rss", TRUMP_TRUTH_RSS, "RSSHub bloqué robots -> trumpstruth RSS")
 
-    # OPEC press_room -> Google News RSS (site:opec.org)
     if "opec.org/opec_web/en/press_room/" in ul:
         return ("rss", OPEC_GOOGLE_NEWS_RSS, "OPEC press_room bloqué robots -> Google News RSS")
 
@@ -190,7 +196,7 @@ class RobotsChecker:
 
 
 # ==========================
-# RawEventsDB (persist + rétention + replay)
+# RawEventsDB (persist + rétention + replay)  + event_type
 # ==========================
 
 class RawEventsDB:
@@ -240,6 +246,8 @@ class RawEventsDB:
                     fetched_at TEXT NOT NULL,
 
                     url TEXT,
+
+                    event_type TEXT,         -- <-- AJOUT (pour l'UI + replay)
                     metadata TEXT,
 
                     is_processed INTEGER DEFAULT 0,
@@ -257,6 +265,7 @@ class RawEventsDB:
             self._ensure_column(conn, "raw_events", "metadata", "TEXT")
             self._ensure_column(conn, "raw_events", "published_at", "TEXT")
             self._ensure_column(conn, "raw_events", "processing_status", "TEXT")
+            self._ensure_column(conn, "raw_events", "event_type", "TEXT")  # <-- IMPORTANT
 
     def insert_if_new(self, event: Dict[str, Any]) -> bool:
         try:
@@ -269,9 +278,9 @@ class RawEventsDB:
                         source_url, source_type,
                         title, content,
                         published_at, fetched_at,
-                        url, metadata,
+                        url, event_type, metadata,
                         is_processed, processing_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.get("event_id"),
@@ -285,6 +294,7 @@ class RawEventsDB:
                         event.get("published_at"),
                         event.get("fetched_at"),
                         event.get("url"),
+                        event.get("event_type"),   # <-- AJOUT
                         event.get("metadata"),
                         int(event.get("is_processed", 0)),
                         event.get("processing_status"),
@@ -299,7 +309,6 @@ class RawEventsDB:
             return False
 
     def purge_older_than_days(self, days: int = 7) -> int:
-        """Supprime les raw_events dont fetched_at est plus vieux que N jours."""
         try:
             days = int(days)
             if days <= 0:
@@ -323,10 +332,6 @@ class RawEventsDB:
             return 0
 
     def list_recent_for_ui(self, days: int = 7, limit: int = 500) -> List[Dict[str, Any]]:
-        """
-        Retourne des items récents pour re-remplir l'onglet News au démarrage.
-        IMPORTANT: on renvoie 'read_at' = fetched_at (original).
-        """
         try:
             days = int(days)
         except Exception:
@@ -340,7 +345,7 @@ class RawEventsDB:
             with self._get_conn() as conn:
                 rows = conn.execute(
                     """
-                    SELECT fetched_at, title, url, source_url, metadata
+                    SELECT fetched_at, title, url, source_url, metadata, event_type
                     FROM raw_events
                     WHERE fetched_at >= datetime('now', ?)
                     ORDER BY fetched_at DESC
@@ -360,19 +365,320 @@ class RawEventsDB:
                 url = (r["url"] or r["source_url"] or "").strip()
                 site = (meta.get("domain") or _domain(url) or _domain(r["source_url"] or "") or "unknown").strip()
                 title = (r["title"] or "").strip() or "(sans titre)"
+                event_type = (r["event_type"] or "unknown").strip() or "unknown"
 
                 out.append(
                     {
-                        "read_at": r["fetched_at"],  # <- timestamp original
+                        "read_at": r["fetched_at"],
                         "site": site,
                         "title": title,
                         "url": url,
+                        "event_type": event_type,
                     }
                 )
             return out
         except Exception as e:
             print(f"[RawEventsDB] Erreur list_recent_for_ui: {e}")
             return []
+
+
+# ==========================
+# Bloc 3 — Event Cards (DB + Normalizer)
+# ==========================
+
+class EventCardsDB:
+    def __init__(self, db_path: str = EVENT_CARDS_DB_PATH):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._init_db()
+
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            pass
+        return conn
+
+    def _init_db(self):
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS event_cards (
+                    card_id TEXT PRIMARY KEY,
+
+                    raw_event_id TEXT,
+                    raw_event_hash TEXT NOT NULL UNIQUE,
+
+                    first_seen_at TEXT NOT NULL,
+                    source_type TEXT,
+
+                    urls TEXT,
+                    entities TEXT,
+
+                    event_type TEXT,
+                    claims TEXT,
+
+                    novelty_score REAL,
+                    severity_score REAL,
+                    evidence_score REAL,
+
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_event_cards_first_seen ON event_cards(first_seen_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_event_cards_type ON event_cards(event_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_event_cards_evidence ON event_cards(evidence_score DESC)")
+            conn.commit()
+
+    def insert_if_new(self, card: Dict[str, Any]) -> bool:
+        try:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO event_cards (
+                        card_id,
+                        raw_event_id, raw_event_hash,
+                        first_seen_at, source_type,
+                        urls, entities,
+                        event_type, claims,
+                        novelty_score, severity_score, evidence_score,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        card.get("card_id"),
+                        card.get("raw_event_id"),
+                        card.get("raw_event_hash"),
+                        card.get("first_seen_at"),
+                        card.get("source_type"),
+                        card.get("urls"),
+                        card.get("entities"),
+                        card.get("event_type"),
+                        card.get("claims"),
+                        float(card.get("novelty_score", 0.0)),
+                        float(card.get("severity_score", 0.0)),
+                        float(card.get("evidence_score", 0.0)),
+                        card.get("created_at"),
+                    ),
+                )
+                conn.commit()
+                return True
+        except sqlite3.IntegrityError:
+            return False
+        except Exception as e:
+            print(f"[EventCardsDB] Erreur insertion: {e}")
+            return False
+
+    def purge_older_than_days(self, days: int = 7) -> int:
+        try:
+            days = int(days)
+            if days <= 0:
+                return 0
+        except Exception:
+            days = 7
+
+        try:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    "DELETE FROM event_cards WHERE first_seen_at < datetime('now', ?)",
+                    (f"-{days} days",),
+                )
+                deleted = cur.rowcount if cur.rowcount is not None else 0
+                conn.commit()
+                if deleted:
+                    print(f"[EventCardsDB] Purge: {deleted} card(s) supprimée(s) (> {days} jours)")
+                return int(deleted)
+        except Exception as e:
+            print(f"[EventCardsDB] Purge erreur: {e}")
+            return 0
+
+
+class EventCardNormalizer:
+    EVENT_TYPE_RULES = [
+        ("central_bank_signal", [
+            "ecb", "bce", "fomc", "federal reserve", "fed",
+            "interest rate", "rate hike", "rate cut", "policy rate",
+            "hausse de taux", "baisse de taux", "taux directeur", "banque centrale",
+            "monetary policy",
+        ]),
+        ("sanctions", [
+            "sanction", "embargo", "export ban", "export controls", "blacklist",
+            "asset freeze", "ofac", "swift",
+            "sanktionen", "sanctions",
+        ]),
+        ("military_escalation", [
+            "attack", "strike", "airstrike", "missile", "drone", "bomb", "shelling",
+            "invasion", "troops", "ceasefire", "mobilization",
+            "attaque", "frappe", "missile", "drone", "bombard", "invasion", "troupes",
+            "guerre", "war",
+        ]),
+        ("shipping_accident", [
+            "ship", "boat", "vessel", "tanker", "cargo", "capsize", "sank", "maritime",
+            "navire", "bateau", "pétrolier", "cargo", "naufrage", "échoué",
+        ]),
+        ("commodity_supply", [
+            "opec", "opec+", "oil output", "production cut", "barrel", "brent", "wti",
+            "pétrole", "baril", "production", "quota",
+        ]),
+        ("macro_data", [
+            "cpi", "inflation", "gdp", "unemployment", "pmi", "jobs report", "nfp",
+            "indice des prix", "croissance", "chômage", "pib", "pmi",
+        ]),
+        ("market_move", [
+            "stocks", "shares", "bond yields", "treasury", "sell-off", "rally",
+            "bourse", "actions", "obligations", "rendements", "chute", "hausse",
+        ]),
+        ("odd_news", [
+            "kangaroo", "zoo", "escaped", "animal",
+            "kangourou", "zoo", "évadé", "s'évade", "animal",
+        ]),
+    ]
+
+    SEVERITY_BY_TYPE = {
+        "military_escalation": 0.90,
+        "sanctions": 0.75,
+        "central_bank_signal": 0.70,
+        "commodity_supply": 0.65,
+        "macro_data": 0.55,
+        "market_move": 0.45,
+        "shipping_accident": 0.35,
+        "odd_news": 0.10,
+        "unknown": 0.25,
+    }
+
+    EVIDENCE_BY_SOURCE_TYPE = {
+        "official_doc": 0.85,
+        "rss": 0.65,
+        "website": 0.55,
+        "social": 0.40,
+    }
+
+    HIGH_TRUST_DOMAINS = {
+        "ecb.europa.eu", "www.ecb.europa.eu",
+        "federalreserve.gov", "www.federalreserve.gov",
+        "imf.org", "www.imf.org",
+        "bis.org", "www.bis.org",
+        "opec.org", "www.opec.org",
+    }
+
+    def normalize(self, raw_event: Dict[str, Any]) -> Dict[str, Any]:
+        title = (raw_event.get("title") or "").strip()
+        content = (raw_event.get("content") or "").strip()
+        content_txt = _strip_html(content)
+
+        url = (raw_event.get("url") or raw_event.get("source_url") or "").strip()
+        source_type = (raw_event.get("source_type") or "").strip().lower()
+
+        meta = {}
+        try:
+            meta = json.loads(raw_event.get("metadata") or "{}")
+        except Exception:
+            meta = {}
+
+        entity_id = (raw_event.get("entity_id") or "").strip()
+        entity_name = (meta.get("entity_name") or "").strip()
+
+        text = (title + "\n" + content_txt).lower()
+
+        event_type = self._classify_event_type(text, entity_name, url)
+        entities = self._extract_entities(text, entity_id, entity_name)
+        claims = self._make_claims(_domain(url), entity_name, title, content_txt, url)
+
+        novelty = 1.0
+        severity = float(self.SEVERITY_BY_TYPE.get(event_type, 0.25))
+        evidence = self._compute_evidence_score(source_type, url)
+
+        return {
+            "card_id": str(uuid.uuid4()),
+            "raw_event_id": raw_event.get("event_id"),
+            "raw_event_hash": raw_event.get("content_hash"),
+
+            "first_seen_at": raw_event.get("fetched_at") or _now_str(),
+            "source_type": source_type,
+
+            "urls": _safe_json([u for u in [url] if u]),
+            "entities": _safe_json(entities),
+
+            "event_type": event_type,
+            "claims": _safe_json(claims),
+
+            "novelty_score": novelty,
+            "severity_score": severity,
+            "evidence_score": evidence,
+
+            "created_at": _now_str(),
+        }
+
+    def _classify_event_type(self, text: str, entity_name: str, url: str) -> str:
+        for etype, keywords in self.EVENT_TYPE_RULES:
+            for k in keywords:
+                if k in text:
+                    return etype
+
+        en = (entity_name or "").lower()
+        if en in ("european central bank", "ecb", "banque centrale européenne"):
+            return "central_bank_signal"
+        if "opec" in en:
+            return "commodity_supply"
+
+        dom = _domain(url)
+        if dom.endswith("ecb.europa.eu") or dom.endswith("federalreserve.gov"):
+            return "central_bank_signal"
+
+        return "unknown"
+
+    def _extract_entities(self, text: str, entity_id: str, entity_name: str) -> List[Dict[str, Any]]:
+        entities: List[Dict[str, Any]] = []
+
+        if entity_id or entity_name:
+            entities.append({"entity_id": entity_id or None, "name": entity_name or None, "role": "primary"})
+
+        keyword_entities = [
+            ("Iran", ["iran", "iranian", "téhéran", "tehran"]),
+            ("Israel", ["israel", "israeli", "gaza", "tel aviv"]),
+            ("Russia", ["russia", "russian", "moscow", "ukraine", "ukrainian", "kyiv", "kiev"]),
+            ("China", ["china", "chinese", "beijing", "taiwan", "taipei"]),
+            ("United States", ["united states", "u.s.", "usa", "washington"]),
+            ("Oil", ["oil", "brent", "wti", "barrel", "pétrole", "baril"]),
+            ("Rates", ["interest rate", "policy rate", "taux", "rate hike", "rate cut", "hausse de taux", "baisse de taux"]),
+        ]
+        for name, kws in keyword_entities:
+            if any(k in text for k in kws):
+                entities.append({"entity_id": None, "name": name, "role": "detected"})
+
+        seen = set()
+        uniq = []
+        for e in entities:
+            key = (e.get("entity_id") or "") + "|" + (e.get("name") or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(e)
+        return uniq
+
+    def _make_claims(self, site: str, entity_name: str, title: str, content_txt: str, url: str) -> List[Dict[str, Any]]:
+        speaker = entity_name or site or "source"
+        excerpt = (content_txt or "")[:350].strip() or (title or "")[:350].strip()
+        claim_text = (title or "").strip()
+        if excerpt and excerpt.lower() not in claim_text.lower():
+            claim_text = (claim_text + " — " + excerpt).strip()
+
+        return [{
+            "speaker": speaker,
+            "text": claim_text[:500],
+            "url": url,
+        }]
+
+    def _compute_evidence_score(self, source_type: str, url: str) -> float:
+        base = float(self.EVIDENCE_BY_SOURCE_TYPE.get(source_type or "rss", 0.55))
+        dom = _domain(url)
+        if dom in self.HIGH_TRUST_DOMAINS:
+            base = max(base, 0.80)
+        return max(0.0, min(1.0, base))
 
 
 # ==========================
@@ -400,11 +706,12 @@ class Watcher:
         self.rate_limiter = rate_limiter
         self.robots_checker = robots_checker
 
+        self.trust_score = source.get("trust_score", None)
+
     def fetch(self) -> List[Dict[str, Any]]:
         if not self.url:
             return []
 
-        # Rewrite automatique (robots / sources cassées)
         new_type, new_url, reason = _rewrite_source_if_needed(self.source_type, self.url)
         if reason and new_url and (new_url != self.url or new_type != self.source_type):
             print(f"[Watcher] Rewrite source: {self.url} -> {new_url} ({reason})")
@@ -473,7 +780,12 @@ class Watcher:
         basis = f"{self.entity_id}|{self.source_id}|{self.source_type}|{item_url}|{title}|{content[:2000]}"
         content_hash = _sha256(basis)
 
-        meta = {"entity_name": self.entity_name, "domain": _domain(item_url or self.url)}
+        meta = {
+            "entity_name": self.entity_name,
+            "domain": _domain(item_url or self.url),
+        }
+        if self.trust_score is not None:
+            meta["trust_score"] = self.trust_score
         if extra_meta:
             meta.update(extra_meta)
 
@@ -489,6 +801,7 @@ class Watcher:
             "published_at": published_at,
             "fetched_at": fetched_at,
             "url": item_url or self.url,
+            "event_type": None,  # calculé ensuite (Bloc 3)
             "metadata": _safe_json(meta),
             "is_processed": 0,
             "processing_status": None,
@@ -596,9 +909,10 @@ class Watcher:
 class WatcherService:
     """
     - Poll les sources actives dans EntityRegistry (SQLite)
-    - Stocke dans raw_events.sqlite
-    - Purge > WATCHER_RETENTION_DAYS (par défaut 7)
-    - Replay au démarrage avec timestamp ORIGINAL (fetched_at) => UI cohérente
+    - Stocke dans raw_events.sqlite (avec event_type)
+    - Purge > WATCHER_RETENTION_DAYS
+    - Replay au démarrage avec fetched_at + event_type
+    - Bloc 3: crée event_cards.sqlite (1 card par raw_event)
     """
 
     def __init__(self, on_item: Optional[Callable[..., None]] = None):
@@ -622,14 +936,20 @@ class WatcherService:
 
         self._last_poll: Dict[int, float] = {}
 
-        # Rétention / purge
+        # Rétention / purge raw_events
         self.retention_days = int(getattr(config, "WATCHER_RETENTION_DAYS", 7))
         self.purge_every_sec = int(getattr(config, "WATCHER_PURGE_EVERY_SEC", 3600))
         self._last_purge_ts = 0.0
 
-        # Replay UI
+        # Replay UI (News tab)
         self._replayed_recent = False
         self.replay_limit = int(getattr(config, "WATCHER_REPLAY_LIMIT", 500))
+
+        # Bloc 3: Event Cards
+        self.enable_event_cards = bool(getattr(config, "ENABLE_EVENT_CARDS", True))
+        self.event_cards_retention_days = int(getattr(config, "EVENT_CARDS_RETENTION_DAYS", self.retention_days))
+        self.event_cards_db = EventCardsDB() if self.enable_event_cards else None
+        self.event_normalizer = EventCardNormalizer() if self.enable_event_cards else None
 
     def start(self, daemon: bool = True):
         if self._running:
@@ -639,7 +959,6 @@ class WatcherService:
         self._running = True
         self._stop_event.clear()
 
-        # Replay des news persistées (pour que l'onglet "News" survive aux redémarrages)
         self._replay_recent_news_once()
 
         self._thread = threading.Thread(target=self._run_loop, daemon=daemon)
@@ -669,6 +988,8 @@ class WatcherService:
             now_ts = time.time()
             if (now_ts - self._last_purge_ts) >= max(60, self.purge_every_sec):
                 self.events_db.purge_older_than_days(self.retention_days)
+                if self.enable_event_cards and self.event_cards_db is not None:
+                    self.event_cards_db.purge_older_than_days(self.event_cards_retention_days)
                 self._last_purge_ts = now_ts
         except Exception:
             pass
@@ -683,17 +1004,17 @@ class WatcherService:
 
         try:
             items = self.events_db.list_recent_for_ui(days=self.retention_days, limit=self.replay_limit)
-            # items est en DESC, on l'envoie en chrono (vieux -> récent) pour l'UI
-            items = list(reversed(items))
+            items = list(reversed(items))  # chrono (vieux -> récent)
 
             sent = 0
             for it in items:
-                # IMPORTANT: on envoie fetched_at ORIGINAL via un "event" minimal
-                ev = {"fetched_at": it.get("read_at")}
+                ev = {
+                    "fetched_at": it.get("read_at"),
+                    "event_type": it.get("event_type", "unknown"),
+                }
                 try:
                     self.on_item(it["site"], it["title"], it["url"], ev)
                 except TypeError:
-                    # compat ancien callback (3 args)
                     try:
                         self.on_item(it["site"], it["title"], it["url"])
                     except Exception:
@@ -708,7 +1029,6 @@ class WatcherService:
             print(f"[WatcherService] Replay UI error: {e}")
 
     def poll_once(self):
-        # Purge périodique (rétention)
         self._maybe_purge()
 
         sources = self.registry.list_all_active_sources()
@@ -757,13 +1077,34 @@ class WatcherService:
                 if self._stop_event.is_set():
                     return
 
+                # --- Bloc 3: calcule event_type AVANT insertion raw ---
+                card = None
+                if self.enable_event_cards and self.event_cards_db is not None and self.event_normalizer is not None:
+                    try:
+                        card = self.event_normalizer.normalize(ev)
+                        ev["event_type"] = card.get("event_type", "unknown")
+                    except Exception as e:
+                        print(f"[EventCards] erreur normalize: {e}")
+                        ev["event_type"] = ev.get("event_type") or "unknown"
+                else:
+                    ev["event_type"] = ev.get("event_type") or "unknown"
+
+                # 1) Insert raw_event (avec event_type)
                 inserted = self.events_db.insert_if_new(ev)
                 if not inserted:
                     continue
 
+                # 2) Insert event_card (si activé) uniquement si raw_event est nouveau
+                if card is not None:
+                    try:
+                        self.event_cards_db.insert_if_new(card)
+                    except Exception as e:
+                        print(f"[EventCards] erreur insert: {e}")
+
                 t = (ev.get("title") or "").strip()
                 u = (ev.get("url") or ev.get("source_url") or "").strip()
-                print(f"[Watcher] ✅ New raw event: {t[:120]} | {u}")
+                et = (ev.get("event_type") or "unknown")
+                print(f"[Watcher] ✅ New raw event: [{et}] {t[:110]} | {u}")
 
                 self._emit_ui(ev)
 
@@ -793,4 +1134,12 @@ class WatcherService:
             pass
 
 
-__all__ = ["RateLimiter", "RobotsChecker", "RawEventsDB", "Watcher", "WatcherService"]
+__all__ = [
+    "RateLimiter",
+    "RobotsChecker",
+    "RawEventsDB",
+    "EventCardsDB",
+    "EventCardNormalizer",
+    "Watcher",
+    "WatcherService",
+]
