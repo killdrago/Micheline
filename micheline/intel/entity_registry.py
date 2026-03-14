@@ -613,6 +613,81 @@ def seed_default_entities():
     
     print("[Registry] Seed data : entités par défaut ajoutées.")
 
+    def seed_news_portfolio_sources():
+        """
+        Ajoute (si manquantes) des sources RSS "grand éventail" dans le registry.
+        Idempotent: ne crée pas de doublons.
+        """
+        registry = EntityRegistry()
+
+        entity_id = "news_portfolio"
+        # Crée l'entité si elle n'existe pas (si elle existe, add_entity retourne False, ce n'est pas grave)
+        registry.add_entity(
+            entity_id=entity_id,
+            name="News Portfolio (RSS Radar)",
+            entity_type="institution",
+            aliases=["news_portfolio", "rss_radar"],
+            topics=["news", "world", "fr", "markets", "rates", "oil"],
+            importance_score=0.85,
+            notes="Portfolio de sources RSS (officielles + Google News RSS par site) pour couvrir large."
+        )
+
+        # URLs déjà présentes (pour éviter les doublons)
+        existing = set()
+        try:
+            for s in registry.get_entity_sources(entity_id, active_only=False):
+                existing.add((s.get("source_type", ""), s.get("url", "")))
+        except Exception:
+            pass
+
+        def gnews_site(site: str, hl="fr", gl="FR", ceid="FR:fr") -> str:
+            # Google News RSS "site:" (très pratique quand le site n'a pas de RSS public fiable)
+            # Note: ":" encodé en %3A
+            return f"https://news.google.com/rss/search?q=site%3A{site}&hl={hl}&gl={gl}&ceid={ceid}"
+
+        sources = [
+            # ---------- RSS officiels (fiables) ----------
+            ("rss", "https://www.lemonde.fr/rss/en_continu.xml", 0.80),
+            ("rss", "https://www.lemonde.fr/economie/rss_full.xml", 0.75),
+            ("rss", "https://www.lemonde.fr/international/rss_full.xml", 0.75),
+
+            ("rss", "http://feeds.bbci.co.uk/news/world/rss.xml", 0.75),
+            ("rss", "https://www.aljazeera.com/xml/rss/all.xml", 0.70),
+
+            # France Diplomatie (RSS officiel)
+            ("rss", "http://www.diplomatie.gouv.fr/spip.php?page=backend-fd", 0.80),
+
+            # Banques centrales / institutions (RSS officiels)
+            ("rss", "https://www.ecb.europa.eu/rss/press.html", 0.90),
+            ("rss", "https://www.ecb.europa.eu/rss/blog.html", 0.80),
+            ("rss", "https://www.bis.org/doclist/all_pressrels.rss", 0.85),
+            ("rss", "https://www.bankofengland.co.uk/rss/news", 0.80),
+
+            # RBA (URLs RSS révélées par leur page RSS)
+            ("rss", "https://www.rba.gov.au/rss/rss-cb-media-releases.xml", 0.75),
+
+            # ---------- Sites “difficiles” => Google News RSS par site ----------
+            ("rss", gnews_site("boursorama.com"), 0.60),
+            ("rss", gnews_site("boursier.com"), 0.60),
+            ("rss", gnews_site("investing.com"), 0.60),
+            ("rss", gnews_site("lefigaro.fr"), 0.55),
+            ("rss", gnews_site("lesechos.fr"), 0.60),
+
+            # Fed: chez toi ça se fait bloquer par robots sur certains chemins => Google News RSS par site
+            ("rss", gnews_site("federalreserve.gov", hl="en", gl="US", ceid="US:en"), 0.70),
+        ]
+
+        added = 0
+        for source_type, url, trust in sources:
+            key = (source_type, url)
+            if key in existing:
+                continue
+            ok = registry.add_source(entity_id=entity_id, source_type=source_type, url=url, trust_score=trust)
+            if ok:
+                existing.add(key)
+                added += 1
+
+        print(f"[Registry] seed_news_portfolio_sources: +{added} source(s) ajoutée(s).")
 
 # ========== Point d'entrée CLI (optionnel) ==========
 
