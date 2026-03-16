@@ -2866,30 +2866,29 @@ class App:
                 return
 
             vals = tree.item(row_id, "values") or ()
-            if len(vals) < 7:
+            if len(vals) < 8:
                 return
 
-            event_type = (vals[3] or "unknown").strip() or "unknown"
+            # (keep, drop, read_at, event_type_id, family, site, title, url)
+            event_type_id = (vals[3] or "unknown").strip() or "unknown"
 
-            # keep (✓)
-            if col == "#1":
-                cur = self._get_category_pref(event_type)
-                new = 0 if cur == 1 else 1   # toggle keep <-> neutre
-                self._set_category_pref(event_type, new)
+            if col == "#1":  # keep
+                cur = self._get_category_pref(event_type_id)
+                new = 0 if cur == 1 else 1
+                self._set_category_pref(event_type_id, new)
                 return "break"
 
-            # drop (✗)
-            if col == "#2":
-                cur = self._get_category_pref(event_type)
-                new = 0 if cur == -1 else -1  # toggle drop <-> neutre
-                self._set_category_pref(event_type, new)
+            if col == "#2":  # drop
+                cur = self._get_category_pref(event_type_id)
+                new = 0 if cur == -1 else -1
+                self._set_category_pref(event_type_id, new)
                 return "break"
 
         except Exception:
             pass
 
         return None
-    
+        
     def _action_cells(self, pref: int) -> tuple[str, str]:
         """
         pref:
@@ -2906,8 +2905,15 @@ class App:
 
     def _insert_news_row(self, tree, read_at: str, event_type: str, site: str, title: str, url: str, pref: int):
         keep_cell, drop_cell = self._action_cells(pref)
+
+        event_type_id = (event_type or "unknown").strip() or "unknown"
+        family_label = self._localize_event_type(event_type_id)
+
         try:
-            tree.insert("", 0, values=(keep_cell, drop_cell, read_at, event_type, site, title, url))
+            tree.insert(
+                "", 0,
+                values=(keep_cell, drop_cell, read_at, event_type_id, family_label, site, title, url)
+            )
         except Exception:
             return
 
@@ -3194,14 +3200,17 @@ class App:
         self.news_notebook.add(self.news_tab_retained, text="Retenu")
         self.news_notebook.add(self.news_tab_blocked, text="Non retenu")
 
-        columns = ("keep", "drop", "read_at", "event_type", "site", "title", "url")
+        # keep / drop / read_at / event_type_id(HIDDEN) / family(VISIBLE) / site / title / url
+        columns = ("keep", "drop", "read_at", "event_type_id", "family", "site", "title", "url")
 
         def make_tree(parent):
             tree = ttk.Treeview(parent, columns=columns, show="headings")
+
             tree.heading("keep", text="✓")
             tree.heading("drop", text="✗")
             tree.heading("read_at", text="Lu le")
-            tree.heading("event_type", text="Famille")
+            tree.heading("event_type_id", text="")  # caché
+            tree.heading("family", text="Famille")
             tree.heading("site", text="Site")
             tree.heading("title", text="Article")
             tree.heading("url", text="URL")
@@ -3209,7 +3218,11 @@ class App:
             tree.column("keep", width=35, anchor="center", stretch=False)
             tree.column("drop", width=35, anchor="center", stretch=False)
             tree.column("read_at", width=155, anchor="w", stretch=False)
-            tree.column("event_type", width=170, anchor="w", stretch=False)
+
+            # Colonne cachée: largeur 0 + pas de stretch
+            tree.column("event_type_id", width=0, minwidth=0, stretch=False)
+
+            tree.column("family", width=190, anchor="w", stretch=False)
             tree.column("site", width=170, anchor="w", stretch=False)
             tree.column("title", width=520, anchor="w", stretch=True)
             tree.column("url", width=520, anchor="w", stretch=True)
@@ -5642,49 +5655,49 @@ class App:
         return translated
               
     def _start_watcher_service(self):
-        self.watcher_service = None
-        self._watcher_thread = None  # (pas utilisé si WatcherService gère son propre thread)
-
-        try:
-            from micheline.intel.watchers import WatcherService
-            from micheline.intel.entity_registry import EntityRegistry, seed_default_entities
-        except Exception as e:
-            print("[WATCHERS] Import impossible:", e)
-            return False
-
-        # 1) Seed auto si registry vide
-        try:
-            registry = EntityRegistry()
-            if not registry.list_all_active_sources():
-                print("[WATCHERS] Registry vide -> seed_default_entities()")
-                seed_default_entities()
-                print("[WATCHERS] ✅ Registry initialisé.")
-        except Exception as e:
-            print("[WATCHERS] Seed registry a échoué:", e)
-        try:
-            from micheline.intel.entity_registry import seed_news_portfolio_sources
-            seed_news_portfolio_sources()
-        except Exception as e:
-            print("[WATCHERS] Seed news portfolio a échoué:", e)
-
-        # 2) Start watcher (avec callback vers l'onglet News si possible)
-        try:
-            # IMPORTANT: on_item=self.news_log_read => le watcher push ce qu'il lit vers ton onglet "News"
-            try:
-                self.watcher_service = WatcherService(on_item=self.news_log_read)
-            except TypeError:
-                # Si ta version de WatcherService n'accepte pas on_item, on retombe sur l'init simple
-                self.watcher_service = WatcherService()
-
-            self.watcher_service.start()  # thread daemon géré par le watcher
-            print("[WATCHERS] Démarré via .start()")
-            return True
-
-        except Exception as e:
-            print("[WATCHERS] start() a échoué:", e)
             self.watcher_service = None
-            return False
-    
+            self._watcher_thread = None  # (pas utilisé si WatcherService gère son propre thread)
+
+            try:
+                from micheline.intel.watchers import WatcherService
+                from micheline.intel.entity_registry import EntityRegistry, seed_default_entities
+            except Exception as e:
+                print("[WATCHERS] Import impossible:", e)
+                return False
+
+            # 1) Seed auto si registry vide
+            try:
+                registry = EntityRegistry()
+                if not registry.list_all_active_sources():
+                    print("[WATCHERS] Registry vide -> seed_default_entities()")
+                    seed_default_entities()
+                    print("[WATCHERS] ✅ Registry initialisé.")
+            except Exception as e:
+                print("[WATCHERS] Seed registry a échoué:", e)
+            try:
+                from micheline.intel.entity_registry import seed_news_portfolio_sources
+                seed_news_portfolio_sources()
+            except Exception as e:
+                print("[WATCHERS] Seed news portfolio a échoué:", e)
+
+            # 2) Start watcher (avec callback vers l'onglet News si possible)
+            try:
+                # IMPORTANT: on_item=self.news_log_read => le watcher push ce qu'il lit vers ton onglet "News"
+                try:
+                    self.watcher_service = WatcherService(on_item=self.news_log_read)
+                except TypeError:
+                    # Si ta version de WatcherService n'accepte pas on_item, on retombe sur l'init simple
+                    self.watcher_service = WatcherService()
+
+                self.watcher_service.start()  # thread daemon géré par le watcher
+                print("[WATCHERS] Démarré via .start()")
+                return True
+
+            except Exception as e:
+                print("[WATCHERS] start() a échoué:", e)
+                self.watcher_service = None
+                return False
+            
     def _refresh_attachments_bar(self):
         # Efface l’ancien contenu
         try:
@@ -6146,7 +6159,46 @@ class App:
         bubble.text.window_create("end", window=frm)
         bubble.text.insert("end", "\n")
         bubble.text.configure(state="disabled")
+ 
+    def _localize_event_type(self, event_type: str) -> str:
+        # event_type = ID interne (anglais) ex: "military_escalation"
+        try:
+            lang = (self._get_ui_lang_code() or "fr").lower()
+        except Exception:
+            lang = "fr"
 
+        et = (event_type or "unknown").strip() or "unknown"
+
+        labels = {
+            "fr": {
+                "central_bank_signal": "Banque centrale / Taux",
+                "military_escalation": "Guerre / Conflit",
+                "sanctions": "Sanctions",
+                "commodity_supply": "Pétrole / Énergie",
+                "macro_data": "Macro-économie",
+                "market_move": "Marchés",
+                "shipping_accident": "Accident maritime",
+                "person_death": "Décès / Nécrologie",
+                "odd_news": "Insolite",
+                "unknown": "Divers",
+            },
+            "en": {
+                "central_bank_signal": "Central bank / Rates",
+                "military_escalation": "War / Conflict",
+                "sanctions": "Sanctions",
+                "commodity_supply": "Oil / Energy",
+                "macro_data": "Macro",
+                "market_move": "Markets",
+                "shipping_accident": "Shipping accident",
+                "person_death": "Obituary / Death",
+                "odd_news": "Odd news",
+                "unknown": "Other",
+            }
+        }
+
+        d = labels.get(lang, labels["fr"])
+        return d.get(et, d.get("unknown", "Divers"))
+    
     def _format_ts(self, ts) -> str:
         """
         Formate le timestamp selon la langue choisie (self.timestamp_lang_var).
