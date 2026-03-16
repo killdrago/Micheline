@@ -498,43 +498,69 @@ class EventCardsDB:
 
 
 class EventCardNormalizer:
+    import unicodedata
+
+    def _deaccent(self, s: str) -> str:
+        # met en minuscule + supprime les accents (décédée -> decedee)
+        s = (s or "").lower()
+        try:
+            import unicodedata
+            s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+        except Exception:
+            pass
+        return s
+
     EVENT_TYPE_RULES = [
+        # Décès / nécrologie
+        ("person_death", [
+            "decede", "decedee", "decedés", "mort", "morte", "meurt", "deces",
+            "died", "dies", "dead", "death", "passed away", "rip"
+        ]),
+
         ("central_bank_signal", [
             "ecb", "bce", "fomc", "federal reserve", "fed",
             "interest rate", "rate hike", "rate cut", "policy rate",
             "hausse de taux", "baisse de taux", "taux directeur", "banque centrale",
             "monetary policy",
         ]),
+
         ("sanctions", [
             "sanction", "embargo", "export ban", "export controls", "blacklist",
             "asset freeze", "ofac", "swift",
-            "sanktionen", "sanctions",
         ]),
+
+        # Guerre / conflit / tensions géopolitiques
         ("military_escalation", [
             "attack", "strike", "airstrike", "missile", "drone", "bomb", "shelling",
             "invasion", "troops", "ceasefire", "mobilization",
             "attaque", "frappe", "missile", "drone", "bombard", "invasion", "troupes",
-            "guerre", "war",
+            "guerre", "conflit", "escalade", "tensions", "hostilites",
+            "war"
         ]),
+
         ("shipping_accident", [
             "ship", "boat", "vessel", "tanker", "cargo", "capsize", "sank", "maritime",
-            "navire", "bateau", "pétrolier", "cargo", "naufrage", "échoué",
+            "navire", "bateau", "petrolier", "cargo", "naufrage", "echoue",
         ]),
+
         ("commodity_supply", [
             "opec", "opec+", "oil output", "production cut", "barrel", "brent", "wti",
-            "pétrole", "baril", "production", "quota",
+            "petrole", "baril", "production", "quota",
         ]),
+
         ("macro_data", [
             "cpi", "inflation", "gdp", "unemployment", "pmi", "jobs report", "nfp",
-            "indice des prix", "croissance", "chômage", "pib", "pmi",
+            "indice des prix", "croissance", "chomage", "pib", "pmi",
         ]),
+
         ("market_move", [
             "stocks", "shares", "bond yields", "treasury", "sell-off", "rally",
             "bourse", "actions", "obligations", "rendements", "chute", "hausse",
         ]),
+
         ("odd_news", [
             "kangaroo", "zoo", "escaped", "animal",
-            "kangourou", "zoo", "évadé", "s'évade", "animal",
+            "kangourou", "zoo", "evade", "s'evade", "animal",
         ]),
     ]
 
@@ -546,6 +572,7 @@ class EventCardNormalizer:
         "macro_data": 0.55,
         "market_move": 0.45,
         "shipping_accident": 0.35,
+        "person_death": 0.20,
         "odd_news": 0.10,
         "unknown": 0.25,
     }
@@ -582,7 +609,8 @@ class EventCardNormalizer:
         entity_id = (raw_event.get("entity_id") or "").strip()
         entity_name = (meta.get("entity_name") or "").strip()
 
-        text = (title + "\n" + content_txt).lower()
+        # IMPORTANT: matching sans accents
+        text = self._deaccent(title + "\n" + content_txt)
 
         event_type = self._classify_event_type(text, entity_name, url)
         entities = self._extract_entities(text, entity_id, entity_name)
@@ -633,32 +661,9 @@ class EventCardNormalizer:
 
     def _extract_entities(self, text: str, entity_id: str, entity_name: str) -> List[Dict[str, Any]]:
         entities: List[Dict[str, Any]] = []
-
         if entity_id or entity_name:
             entities.append({"entity_id": entity_id or None, "name": entity_name or None, "role": "primary"})
-
-        keyword_entities = [
-            ("Iran", ["iran", "iranian", "téhéran", "tehran"]),
-            ("Israel", ["israel", "israeli", "gaza", "tel aviv"]),
-            ("Russia", ["russia", "russian", "moscow", "ukraine", "ukrainian", "kyiv", "kiev"]),
-            ("China", ["china", "chinese", "beijing", "taiwan", "taipei"]),
-            ("United States", ["united states", "u.s.", "usa", "washington"]),
-            ("Oil", ["oil", "brent", "wti", "barrel", "pétrole", "baril"]),
-            ("Rates", ["interest rate", "policy rate", "taux", "rate hike", "rate cut", "hausse de taux", "baisse de taux"]),
-        ]
-        for name, kws in keyword_entities:
-            if any(k in text for k in kws):
-                entities.append({"entity_id": None, "name": name, "role": "detected"})
-
-        seen = set()
-        uniq = []
-        for e in entities:
-            key = (e.get("entity_id") or "") + "|" + (e.get("name") or "")
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(e)
-        return uniq
+        return entities
 
     def _make_claims(self, site: str, entity_name: str, title: str, content_txt: str, url: str) -> List[Dict[str, Any]]:
         speaker = entity_name or site or "source"
@@ -666,12 +671,7 @@ class EventCardNormalizer:
         claim_text = (title or "").strip()
         if excerpt and excerpt.lower() not in claim_text.lower():
             claim_text = (claim_text + " — " + excerpt).strip()
-
-        return [{
-            "speaker": speaker,
-            "text": claim_text[:500],
-            "url": url,
-        }]
+        return [{"speaker": speaker, "text": claim_text[:500], "url": url}]
 
     def _compute_evidence_score(self, source_type: str, url: str) -> float:
         base = float(self.EVIDENCE_BY_SOURCE_TYPE.get(source_type or "rss", 0.55))
@@ -679,8 +679,7 @@ class EventCardNormalizer:
         if dom in self.HIGH_TRUST_DOMAINS:
             base = max(base, 0.80)
         return max(0.0, min(1.0, base))
-
-
+       
 # ==========================
 # Watcher (1 source)
 # ==========================
