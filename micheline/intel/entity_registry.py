@@ -675,6 +675,11 @@ def seed_default_entities():
 
             # Fed: chez toi ça se fait bloquer par robots sur certains chemins => Google News RSS par site
             ("rss", gnews_site("federalreserve.gov", hl="en", gl="US", ceid="US:en"), 0.70),
+           
+            # Google news
+            ("rss", "https://news.google.com/rss?hl=fr&gl=FR&ceid=FR:fr", 0.70),
+
+        
         ]
 
         added = 0
